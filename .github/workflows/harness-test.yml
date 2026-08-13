@@ -1,0 +1,181 @@
+# ===========================================================================
+#  PREREQUISITO DEL GATE DE CD
+#
+#  El gate de CD no puede validar la base image si el artefacto no la
+#  declara. Este workflow muestra las dos piezas que hay que añadir al
+#  build actual de GitHub Actions:
+#
+#    1. Estampar los labels OCI de base image en la app image (paso `build`).
+#    2. Llamar a la API de Harness pasando repo+tag como input (paso `deploy`).
+#
+#  El paso 2 es además el mismo patrón que necesita el mass deploy del
+#  driver file: los "input sets" viajan como JSON en el body de la llamada.
+# ===========================================================================
+
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main, "release/**", "feature/**"]
+
+env:
+  REGISTRY: harness-registry.example.io
+  APP_REPO: harness-registry.example.io/apps/app1
+
+  # La base image la resuelve el propio build desde la policy de Harness,
+  # así nadie la escribe a mano en el Dockerfile.
+  POLICY_ID: hardened_image_cd
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      app_tag: ${{ steps.meta.outputs.app_tag }}
+      base_ref: ${{ steps.base.outputs.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------
+      # Misma llamada que hace el gate: una sola fuente de verdad para la
+      # base image, consumida tanto por el build como por la validación.
+      # -------------------------------------------------------------------
+      - name: Resolver base image hardened desde la policy de Harness
+        id: base
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
+          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
+          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          curl -sS --fail-with-body \
+            -H "x-api-key: ${HARNESS_API_KEY}" \
+            "https://app.harness.io/pl/api/v1/policy/${POLICY_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
+            -o policy.json
+
+          jq -r '.rego' policy.json > policy.rego
+
+          BASE_REPO=$(grep -A4 '^stable_base' policy.rego | grep '"repo"' | cut -d'"' -f4)
+          BASE_TAG=$(grep -A4 '^stable_base' policy.rego | grep '"tag"' | cut -d'"' -f4)
+          BASE_DIGEST=$(grep -A4 '^stable_base' policy.rego | grep '"digest"' | cut -d'"' -f4)
+
+          echo "base_ref=${BASE_REPO}:${BASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "base_digest=${BASE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Base image hardened vigente: ${BASE_REPO}:${BASE_TAG}"
+
+      - name: Metadata
+        id: meta
+        run: echo "app_tag=v$(date +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      # -------------------------------------------------------------------
+      # LA PIEZA CLAVE: los labels org.opencontainers.image.base.*
+      # Sin esto el gate de CD falla por la regla [A1] (fallo cerrado).
+      #
+      # El Dockerfile debe declarar:  ARG BASE_IMAGE
+      #                               FROM ${BASE_IMAGE}
+      # -------------------------------------------------------------------
+      - name: Build y push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ steps.base.outputs.base_ref }}
+          tags: ${{ env.APP_REPO }}:${{ steps.meta.outputs.app_tag }}
+          labels: |
+            org.opencontainers.image.base.name=${{ steps.base.outputs.base_ref }}
+            org.opencontainers.image.base.digest=${{ steps.base.outputs.base_digest }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  # =====================================================================
+  # Disparo del CD en Harness. Nadie copia tags a mano en la consola:
+  # el tag construido viaja en el body de la llamada.
+  # =====================================================================
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disparar pipeline de CD en Harness
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
+          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
+          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
+          APP_TAG: ${{ needs.build.outputs.app_tag }}
+        run: |
+          set -euo pipefail
+
+          cat > runtime-inputs.yaml <<EOF
+          pipeline:
+            identifier: cd_deploy_policy_gate
+            variables:
+              - name: app_image_repo
+                type: String
+                value: ${APP_REPO}
+              - name: app_image_tag
+                type: String
+                value: ${APP_TAG}
+              - name: env_type
+                type: String
+                value: PreProduction
+              - name: change_number
+                type: String
+                value: ""
+              - name: run_artifact_scan
+                type: String
+                value: "true"
+          EOF
+
+          RESP=$(curl -sS --fail-with-body -X POST \
+            -H "x-api-key: ${HARNESS_API_KEY}" \
+            -H "Content-Type: application/yaml" \
+            "https://app.harness.io/pipeline/api/pipeline/execute/cd_deploy_policy_gate?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
+            --data-binary @runtime-inputs.yaml)
+
+          EXEC_ID=$(echo "$RESP" | jq -r '.data.planExecution.uuid')
+          echo "Ejecución de Harness: ${EXEC_ID}"
+          echo "$EXEC_ID" > exec_id.txt
+
+      # -----------------------------------------------------------------
+      # Polling: el control vuelve a GitHub Actions con el resultado real
+      # del despliegue. Esto es lo que pedía Anil (min 39:38): no tener
+      # que entrar a la consola de Harness para saber si pasó o falló.
+      # -----------------------------------------------------------------
+      - name: Esperar resultado del despliegue
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
+          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
+          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          EXEC_ID=$(cat exec_id.txt)
+
+          for i in $(seq 1 120); do
+            STATUS=$(curl -sS \
+              -H "x-api-key: ${HARNESS_API_KEY}" \
+              "https://app.harness.io/pipeline/api/pipelines/execution/v2/${EXEC_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
+              | jq -r '.data.pipelineExecutionSummary.status')
+
+            echo "[$i] Estado: ${STATUS}"
+
+            case "${STATUS}" in
+              Success)
+                echo "Despliegue completado."
+                exit 0 ;;
+              Failed|Aborted|Errored|Expired|ApprovalRejected)
+                echo "::error::El despliegue terminó en estado ${STATUS}. Revisa el gate de hardening."
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+
+          echo "::error::Timeout esperando el despliegue."
+          exit 1
