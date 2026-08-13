@@ -1,189 +1,292 @@
-# Policy Gate en CD — Hardening enforcement antes del despliegue
+# Hardening policy gate for Harness CD
 
-Respuesta al pedido de Barath y Ramesh en la llamada (min 15:32 – 18:34):
+This repository answers the three asks from the call, using a single policy
+document as the source of truth for all of them.
 
-> *"Is there a way we can implement the same policy on the CD part?"*
-> *"…if there is a registry of vulnerable images, the application image, not even the base image… if the image is vulnerable, then we should not allow the deployment."*
-> *"Both combination will be best. One is the application container image itself… another approach will be based on the base image level."*
+> **"Is there a way we can implement the same policy on the CD part?"** — Ramesh, 15:32
+>
+> **"…if there is a registry of vulnerable images, the application image, not even the base image… if the image is vulnerable, then we should not allow the deployment."** — Barath, 16:50
+>
+> **"Both combination will be best. One is the application container image itself… another approach will be based on the base image level."** — Ramesh, 17:37
 
-Las dos validaciones, en un solo gate, alimentadas por la **misma policy** que ya
-aplicas en CI.
+Both checks, in one gate, driven by the **same policy** already enforced in CI.
 
 ---
 
-## La idea central del demo
+## The core idea
 
-El punto fuerte no es que Harness pueda bloquear un despliegue. Es que hay **una
-sola fuente de verdad** y **dos puntos de aplicación**:
+The point is not that Harness can block a deployment. The point is that there is
+**one source of truth** and **several enforcement points**:
 
 ```
         ┌─────────────────────────────────────────┐
-        │   Pipeline de hardening de base image   │
-        │   (el que ya demostraste)               │
-        │   0 críticos  ->  PATCH de la policy    │
+        │   Base image hardening pipeline         │
+        │   0 criticals  ->  PATCH the policy     │
         └────────────────┬────────────────────────┘
-                         │  escribe stable_base
+                         │  writes stable_base
                          ▼
         ┌─────────────────────────────────────────┐
-        │   Policy en Harness Policy Management   │
+        │   Policy in Harness Policy Management   │
         │   stable_base = 1.0.42                  │
         │   blocked_artifacts = [...]             │
-        └───────┬─────────────────────┬───────────┘
-                │                     │
-        lee     │                     │  lee
-                ▼                     ▼
-    ┌───────────────────┐   ┌─────────────────────┐
-    │  Gate en CI       │   │  Gate en CD         │
-    │  (Dockerfile)     │   │  (artefacto + base) │
-    │  ya demostrado    │   │  ESTO ES LO NUEVO   │
-    └───────────────────┘   └─────────────────────┘
+        └──┬──────────────┬──────────────────┬────┘
+           │ reads        │ reads            │ reads
+           ▼              ▼                  ▼
+    ┌────────────┐  ┌────────────┐  ┌──────────────────┐
+    │ CI gate    │  │ CD gate    │  │ Mass deploy      │
+    │ Dockerfile │  │ artifact   │  │ orchestrator     │
+    │ (existing) │  │ + base     │  │ driver file      │
+    └────────────┘  └────────────┘  └──────────────────┘
 ```
 
-Nadie edita la versión estable a mano. Cuando el pipeline de hardening publica
-`1.0.42`, el gate de CD empieza a rechazar todo lo construido sobre `1.0.39`
-**en el mismo instante**, sin tocar un solo pipeline.
+Nobody edits the stable version by hand. When the hardening pipeline publishes
+`1.0.43`, every gate starts rejecting artifacts built on `1.0.42` **at that same
+instant, without touching a single deployment pipeline.** With 100 applications
+that is the difference between one change and one hundred.
 
 ---
 
-## Qué valida el gate
+## What the gate validates
 
-| Regla | Qué comprueba | Origen en la llamada |
+| Rule | What it checks | Where it came from |
 |---|---|---|
-| **A1** | El artefacto declara su base image (label OCI o SBOM). Si no, **falla cerrado** | trazabilidad, min 18:14 |
-| **A2** | La base image viene del repo hardened aprobado | Ramesh, min 17:37 |
-| **A3** | La versión de base image es la vigente (`stable_base.tag`) | el caso que ya demostraste en CI |
-| **A4** | El digest coincide, no solo el tag (detecta tags sobrescritos) | *añadido — no lo pidieron* |
-| **B1** | El artefacto de aplicación no está en la denylist | Barath, min 16:50 |
-| **B2/B3** | El escaneo del artefacto no supera los umbrales de críticos/altas | Barath, min 17:00 |
-| **C1** | Producción exige `change_number` | campo que ya trae el driver file |
+| **A1** | The artifact declares its base image (OCI label or annotation). If not, it **fails closed** | traceability, 18:14 |
+| **A2** | The base image comes from an approved hardened repository | Ramesh, 17:37 |
+| **A3** | The base image version is the current one (`stable_base.tag`) | the case already demoed in CI |
+| **A4** | The digest matches, not just the tag — catches overwritten tags | *added, not requested* |
+| **B1** | The application artifact is not on the denylist | Barath, 16:50 |
+| **B2 / B3** | The artifact scan is within the critical / high thresholds | Barath, 17:00 |
+| **C1** | Production requires a `change_number` | *added* — the driver file already carries it |
+| **C2** | Production should carry `approval=required` — **warning only** | *added* — from `deploy_params` |
 
-`A4` y `C1` no los pidieron: son valor añadido que puedes ofrecer en la llamada.
-`C1` en particular conecta este gate con el driver file del mass deploy, que ya
-trae `change_number` en las entradas de `Prod`.
+`A4`, `C1` and `C2` were not requested; they are value-add to offer during the
+call. `C1` and `C2` are worth pointing out because they are derived from the
+customer's own driver file: every `Prod` entry already has `change_number` and
+`approval=required`, and no `Dev` or `Test` entry does. The rules formalise
+something their file already satisfies, so they cost the customer nothing.
 
----
-
-## Cómo funciona el pipeline
-
-`pipelines/cd_deploy_policy_gate.yaml` — dos stages:
-
-**Stage 1 · Pre-Deploy Gate** (recolecta hechos, luego decide una sola vez)
-
-1. `prepare_tools` — descarga `crane` y `opa` al workspace compartido `/harness`
-2. `fetch_policy` — `GET` a Harness Policy Management, extrae el Rego → misma llamada que ya usas en CI
-3. `resolve_base_image` — `crane config` sobre el artefacto, lee `org.opencontainers.image.base.name` / `.base.digest`
-4. `scan_app_image` — Trivy sobre el artefacto de aplicación, `--exit-code 0` a propósito (el veredicto lo da la policy, no el scanner)
-5. `evaluate_gate` — arma un único `input.json` y evalúa `deny` con OPA. Si hay violaciones, imprime cada mensaje y sale con 1
-
-**Stage 2 · Deploy** — solo corre si el gate pasó, y arranca registrando el veredicto en el log del despliegue (auditoría).
-
-La separación importa: **recolectar hechos ≠ decidir**. Los cuatro primeros pasos
-solo producen datos; toda la lógica de decisión vive en el Rego, que es lo que el
-cliente puede versionar y auditar.
+`C2` is deliberately a warning rather than a block. Promoting it is a four-line
+move into the `deny` block — that is the customer's call, not ours.
 
 ---
 
-## El prerequisito que hay que negociar con el cliente
+## Repository layout
 
-**El gate no funciona si el artefacto no declara su base image.** Ahí está el
-único trabajo que cae del lado de ellos, y conviene plantearlo el viernes con las
-tres opciones sobre la mesa:
+```
+policies/hardened_image_cd.rego         The policy: the source of truth
+  └─ managed stable_base block           rewritten by the hardening pipeline
 
-| Opción | Qué implica | Cuándo elegirla |
-|---|---|---|
-| **Labels OCI** (recomendada) | Añadir `labels:` en `docker/build-push-action`. Ver `ci/github-actions-build-and-trigger.yml`. Cambio de ~4 líneas por repo | si pueden tocar el workflow de GHA |
-| **SBOM / SSCA** | Harness SSCA genera y firma el SBOM en el build; el gate lo consulta en vez de leer labels | si ya piensan adoptar SSCA — es la más robusta, pero suma alcance |
-| **Properties de JFrog** | Un job estampa la base image como property del artefacto en Artifactory | si no pueden tocar el build en absoluto |
+pipelines/
+  cd_deploy_policy_gate.yaml            Harness: gate stage + deploy stage
+  cd_policy_gate_only.yaml              The gate alone, reusable, deploys nothing
 
-La opción de labels es la que menos fricción tiene, y como bonus el workflow de
-ejemplo **resuelve la base image desde la misma policy en tiempo de build**, así
-que el `Dockerfile` deja de tener la versión hardcodeada. Eso mata de raíz el
-problema que demostraste en CI: ya no hay que bloquear al desarrollador por poner
-`1.0.39`, porque el desarrollador nunca escribe la versión.
+driver/
+  deployment_driver_file.yaml           The customer's file, verbatim
+  demo_driver_file.yaml                 Same schema, tuned for the demo
+  README.md                             How the file maps onto the gate
 
-Mencióna eso en la llamada. Es el argumento más fuerte que tienes.
+.github/workflows/
+  build-and-deploy.yml                  Build + OCI labels + trigger Harness + poll
+  harden-base-image.yml                 Build the base, scan it, PATCH stable_base
+  mass-deploy.yml                       Driver file -> matrix -> gate per entry -> report
+  policy-test.yml                       opa check + fmt + all scenarios on every PR
+
+app/                                    Buildable application artifact
+  Dockerfile                            ARG BASE_IMAGE — the version is NOT in here
+  pom.xml, src/                         minimal Java service, no external deps
+
+base/                                   Buildable hardened base image
+  Dockerfile                            remediations + non-root user
+  VERSION                               candidate version
+
+k8s/                                    Manifests for the Harness service
+  values.yaml, templates/               image = <+artifact.image>
+
+scripts/                                One gate phase per script, all reusable
+  fetch_policy.sh                       policy + stable_base (Harness or local)
+  resolve_base_image.sh                 from a tag to its lineage, via crane
+  scan_app_image.sh                     trivy with --exit-code 0 on purpose
+  evaluate_gate.sh                      assembles the input, evaluates deny
+  update_stable_base.sh                 PATCH the managed block, publish it
+  driver_expand.py                      driver file -> flat list of deployment jobs
+  mass_deploy.sh                        the orchestrator: gate per entry, one report
+  bootstrap.sh                          replaces ghcr.io/OWNER with your owner
+
+test/
+  cases.sh                              15 assertions, deny and warn
+  fixtures/*.json                       one input per scenario
+
+Makefile                                make tools / test / check / gate / driver
+docs/demo-runbook.md                    demo script and open verifications
+```
 
 ---
 
-## Guion sugerido (unos 8 minutos)
-
-1. **Contexto** (30 s) — "Me pidieron llevar la policy a CD. Lo hice, y validando las dos cosas: la app image y la base image con la que se construyó."
-2. **Mostrar la policy** (1 min) — señalar `stable_base` y recordar que ese bloque lo escribe el pipeline de hardening, no una persona.
-3. **Caso que pasa** (1.5 min) — desplegar `app1:v1.2`, construido sobre `1.0.42`. El log del gate muestra la base image resuelta y el veredicto. El deploy procede.
-4. **Caso bloqueado por base image** (2 min) — desplegar un artefacto construido sobre `1.0.39`. El gate falla con `[A3]` y el mensaje dice exactamente qué reconstruir. **Nada llegó al cluster.** Este es el momento del demo.
-5. **Caso bloqueado por denylist** (1.5 min) — `app2:v1.5` con base image correcta pero en `blocked_artifacts`. Muestra que las dos validaciones son independientes: la app image puede ser vulnerable aunque la base sea perfecta. Es literalmente lo que dijo Barath.
-6. **Cierre** (1 min) — sin tocar ningún pipeline, el equipo de seguridad publica una base image nueva o añade un artefacto a la denylist, y los N pipelines de despliegue lo respetan de inmediato. Con 100 apps eso es la diferencia entre un cambio y cien.
-
-Prepara los tres artefactos **antes** de la llamada. En la reunión pasada perdiste
-tiempo esperando que el push se reflejara (min 11:38) y tuviste que saltarte
-parte del flujo. Con imágenes ya publicadas el gate corre en menos de un minuto.
-
----
-
-## Validar la policy localmente
+## Getting started
 
 ```bash
-curl -sSL -o opa https://openpolicyagent.org/downloads/v0.68.0/opa_linux_amd64_static
-chmod +x opa
-OPA=./opa ./test/cases.sh
+# 1. Replace the registry placeholder with your GitHub owner
+./scripts/bootstrap.sh <your-owner>
+
+# 2. Local tooling and policy validation
+make tools
+make check
+
+# 3. Publish the hardened base image
+#    Actions -> harden-base-image -> Run workflow
+
+# 4. Build the application artifact
+#    Actions -> build-and-deploy -> Run workflow (skip_deploy = true the first time)
+
+# 5. Build the "bad" artifact for the blocking demo
+#    Actions -> build-and-deploy -> base_tag_override = 1.0.39
 ```
 
-Seis escenarios, ya ejecutados y verificados:
+Steps 3 and 4 work without Harness: the workflow falls back to the policy in the
+repository when `HARNESS_API_KEY` is absent, and the deploy job skips with a
+warning. That lets you get the artifacts published and verified before wiring
+anything up.
 
-| Caso | Esperado | Resultado |
+### Secrets
+
+| GitHub secret | Used for |
+|---|---|
+| `GITHUB_TOKEN` | automatic; pushing to GHCR |
+| `HARNESS_API_KEY` | fetching/publishing the policy, triggering CD |
+| `HARNESS_ACCOUNT_ID`, `HARNESS_ORG_ID`, `HARNESS_PROJECT_ID` | account identifiers |
+
+| Harness secret | Used for |
+|---|---|
+| `harness_api_key` | the gate fetches the policy |
+| `artifact_registry_user` / `artifact_registry_token` | `crane` and `trivy` read the artifact |
+
+With GHCR, `artifact_registry_user` is your GitHub username and the token is a
+PAT with `read:packages`. GHCR packages are private by default: either make them
+public or the PAT is mandatory.
+
+---
+
+## The prerequisite to negotiate with the customer
+
+**The gate cannot work if the artifact does not declare its base image.** That is
+the only work that falls on their side, and it is worth putting on the table with
+all three options:
+
+| Option | What it takes | When to pick it |
 |---|---|---|
-| Artefacto conforme | permitido | ✅ permitido |
-| Base image `1.0.39` | bloqueado `[A3]` | ✅ bloqueado |
-| Artefacto en denylist | bloqueado `[B1]` | ✅ bloqueado |
-| Sin label de base image | bloqueado `[A1]` | ✅ bloqueado |
-| Prod sin change_number + 2 críticos | bloqueado `[B2] [B3] [C1]` | ✅ 3 violaciones |
-| Repo exento (sandbox) | permitido | ✅ permitido |
+| **OCI labels** (recommended) | add `labels:` to `docker/build-push-action`; ~4 lines per repository | if they can touch the GHA workflow |
+| **SBOM / SSCA** | Harness SSCA generates and signs the SBOM at build time; the gate queries it instead of reading labels | if they already plan to adopt SSCA — most robust, but adds scope |
+| **JFrog properties** | a job stamps the base image as an artifact property in Artifactory | if they cannot touch the build at all |
+
+The labels option has the least friction, and as a bonus the example workflow
+**resolves the base image from the same policy at build time**, so the Dockerfile
+no longer hardcodes the version:
+
+```dockerfile
+ARG BASE_IMAGE          # injected by the workflow, read from the policy
+FROM ${BASE_IMAGE}
+```
+
+That removes the root cause of the problem demoed in CI: there is no longer any
+need to block a developer for writing `1.0.39`, because the developer never
+writes the version at all. **This is the strongest argument in the repository —
+make it during the call.** The CI gate still earns its place as a safety net: it
+catches anyone who hardcodes a `FROM` and bypasses the mechanism.
 
 ---
 
-## Cosas que tienes que ajustar o verificar antes del viernes
+## Mass deploy, driven by the customer's driver file
 
-**Ajustes obvios de entorno**
+`driver/deployment_driver_file.yaml` is the customer's actual file. Two things in
+it shaped the design:
 
-- `orgIdentifier` / `projectIdentifier` en el pipeline
-- Secretos: `harness_api_key`, `artifact_registry_user`, `artifact_registry_token`
-- Repos y tags de ejemplo (`harness-registry.example.io/...`) por los tuyos
-- `serviceRef` / `environmentRef` / `infrastructureDefinitions` del stage de Deploy
+**1. Every entry names its own `pipeline_id` and `input_set_id`.** With 100 apps
+there are 100 deployment pipelines, each with its own input set. Putting the gate
+inside each one is a change in a hundred places. So the gate runs as a separate,
+reusable pipeline (`cd_policy_gate_only`) that the orchestrator invokes once per
+entry, and the customer's pipeline is called **unmodified** only if the gate
+passes.
 
-**Verificaciones que no pude hacer desde aquí**
+**2. `disable`, `change_number` and `deploy_params` are already there.** No new
+fields had to be invented: `disable: true` is a per-entry kill switch,
+`change_number` satisfies `C1`, `deploy_params` feeds `C2`.
 
-1. **El endpoint de Policy Management.** Usé `GET /pl/api/v1/policy/{id}` y extraigo el campo `.rego`. Tú ya llamas a este endpoint en el gate de CI — sustituye por la ruta y el campo exactos que te funcionan, y ajusta el `jq`.
-2. **Stage tipo CI en una cuenta CD-only.** Usé un stage `CI` con `cloneCodebase: false` sobre Harness Cloud porque los steps `Run` son cómodos y el workspace `/harness` se comparte entre pasos. Si la cuenta del demo no tiene licencia de CI, cámbialo por un stage `Custom` con `Container` steps, o mueve los cinco pasos a un **step group dentro del stage de Deployment**. Esa última variante tiene una ventaja: ahí sí resuelve `<+artifact.image>` y `<+artifact.tag>`, así que no necesitas las variables de pipeline. La usé como variables porque **coincide con el flujo real del cliente** — GHA llama a la API pasando el tag, y el driver file inyecta los valores por input set.
-3. **Sintaxis Rego del engine de Harness.** Escribí `deny[msg] { }` (Rego v0), que es lo que usan los ejemplos de Harness y lo que valida OPA 0.68. Si el engine de tu cuenta ya corre OPA 1.x, habrá que pasar a `deny contains msg if { }`.
-4. **El conteo de severidades de Trivy** lo hago con `grep -c` sobre el JSON. Funciona y es a prueba de cambios de schema, pero si prefieres precisión usa `jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length'`.
-5. **Autenticación de `crane`** con el registry: si usan JFrog con tokens de acceso, verifica que `crane auth login` funcione con esas credenciales antes del demo.
+```bash
+# Evaluate the whole fleet without deploying anything
+./scripts/mass_deploy.sh --driver driver/deployment_driver_file.yaml \
+                         --group Dev \
+                         --registry-prefix ghcr.io/<owner> \
+                         --dry-run --no-scan
+```
 
----
-
-## Cómo esto se conecta con los otros dos temas
-
-Este gate no es una pieza aislada — es el bloque que se reutiliza en los otros dos
-pedidos de la llamada:
-
-- **Pipeline lineal con GHA** → el gate es el primer stage antes de cada
-  promoción de entorno. Dev, QA, UAT y Prod pasan por el mismo gate con distinto
-  `env_type`. Y `C1` hace que solo Prod exija el change number.
-- **Mass deploy con el driver file** → el orquestador ejecuta el gate **una vez
-  por entrada** del driver file. Con `disable: true` la entrada ni se evalúa;
-  con `change_number` presente en `Prod`, `C1` se satisface automáticamente. Si
-  50 de 100 apps se construyeron sobre una base retirada, el orquestador te da un
-  reporte de las 50 en una sola ejecución en lugar de fallar de a una.
-
-Ese es el argumento de venta: el gate escala solo porque la decisión está
-centralizada en un documento, no replicada en N pipelines.
-
----
-
-## Archivos
+One report for the entire fleet:
 
 ```
-policies/hardened_image_cd.rego              La policy (fuente de verdad)
-pipelines/cd_deploy_policy_gate.yaml         Pipeline de Harness: gate + deploy
-ci/github-actions-build-and-trigger.yml      Prerequisito: labels OCI + trigger a Harness
-test/cases.sh                                Seis escenarios validados con OPA
+ENTRY                      ARTIFACT                               VERDICT      RULES
+Dev-app1-dev1              ghcr.io/OWNER/app1:v1.2                PASSED       -
+Dev-app1-dev2              ghcr.io/OWNER/app1:v1.1-base1039       BLOCKED      A3
+Dev-app2-dev3              ghcr.io/OWNER/app2:v1.5                BLOCKED      B1
+Prod-app1-prod             ghcr.io/OWNER/app1:v1.2                PASSED       -
+Prod-app4-prod             ghcr.io/OWNER/app4:v1.20               BLOCKED      A1 C1
 ```
+
+If 50 of 100 applications were built on a withdrawn base image, that is 50 rows
+in a single run instead of 50 pipelines failing one at a time. The same thing
+runs as a GitHub Actions matrix — one entry per runner, in parallel — via
+`.github/workflows/mass-deploy.yml`.
+
+**One open question for the customer:** the driver file names the app (`app1`)
+and its version (`v1.2`) but not the container image path. The orchestrator
+builds the reference by convention, `${REGISTRY_PREFIX}/${name}:${version}`.
+Either an optional `image_repo:` per entry or a top-level `registry_prefix:`
+makes it explicit — both are already supported. See `driver/README.md`.
+
+---
+
+## How this connects to the linear pipeline ask
+
+The gate becomes the first stage before each environment promotion. Dev, QA, UAT
+and Prod all go through the same gate with a different `env_type`, and `C1` means
+only Prod demands the change number. The polling step in `build-and-deploy.yml`
+hands control back to GitHub Actions with the real deployment result, which is
+what Anil asked for at 39:38 — no need to open the Harness console to find out
+whether it passed.
+
+The selling argument for all three asks is the same: enforcement scales because
+the decision lives in one document, not replicated across N pipelines.
+
+---
+
+## Validating without Harness, without a registry, without a cluster
+
+```bash
+make tools
+make test
+```
+
+| Scenario | Expected | Result |
+|---|---|---|
+| Compliant artifact | allowed | ✅ allowed |
+| Base image `1.0.39` | blocked `[A3]` | ✅ blocked |
+| Artifact on the denylist | blocked `[B1]` | ✅ blocked |
+| No base image label | blocked `[A1]` | ✅ blocked |
+| Prod, no change_number, 2 criticals | blocked `[B2] [B3] [C1]` | ✅ 3 violations |
+| Exempt repository (sandbox) | allowed | ✅ allowed |
+| Right tag, different digest | blocked `[A4]` | ✅ blocked |
+| Prod compliant with change_number | allowed | ✅ allowed |
+| `driver` Prod[0] app1/prod | allowed, no warnings | ✅ allowed |
+| `driver` Prod without approval | allowed + `[C2]` warning | ✅ 1 warning |
+| `driver` Dev app2/dev3 | blocked `[B1]` | ✅ blocked |
+
+15 of 15 assertions pass on OPA 0.68.0, deny and warn rules included.
+
+The full gate against a real, already published artifact:
+
+```bash
+make gate APP=ghcr.io/<owner>/app1:v20260813-abc1234
+```
+
+---
+
+Demo script, environment tweaks and the verifications still open:
+[`docs/demo-runbook.md`](docs/demo-runbook.md).
