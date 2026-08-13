@@ -1,181 +1,269 @@
-# ===========================================================================
-#  PREREQUISITO DEL GATE DE CD
+# =============================================================================
+#  MASS DEPLOY dirigido por el driver file
 #
-#  El gate de CD no puede validar la base image si el artefacto no la
-#  declara. Este workflow muestra las dos piezas que hay que añadir al
-#  build actual de GitHub Actions:
+#  Responde al tercer pedido de la llamada (Ramesh, min 42:23 – 44:08; Barath,
+#  min 30:16): un orquestador fuera de la consola, dirigido por configuracion,
+#  capaz de desplegar N componentes en paralelo.
 #
-#    1. Estampar los labels OCI de base image en la app image (paso `build`).
-#    2. Llamar a la API de Harness pasando repo+tag como input (paso `deploy`).
+#  Tres jobs:
+#     expand  -> convierte el driver file en una matriz de GitHub Actions
+#     gate    -> una entrada por runner, en paralelo: gate y, si pasa, SU pipeline
+#     report  -> UN reporte de toda la flota
 #
-#  El paso 2 es además el mismo patrón que necesita el mass deploy del
-#  driver file: los "input sets" viajan como JSON en el body de la llamada.
-# ===========================================================================
-
-name: build-and-deploy
+#  Lo importante del diseno: los N pipelines de despliegue del cliente NO se
+#  modifican. El gate vive fuera y decide si llegar a llamarlos.
+# =============================================================================
+name: mass-deploy
 
 on:
-  push:
-    branches: [main, "release/**", "feature/**"]
+  workflow_dispatch:
+    inputs:
+      driver_file:
+        description: "Ruta del driver file"
+        type: string
+        default: driver/deployment_driver_file.yaml
+      group:
+        description: "Grupo del driver file a procesar"
+        type: choice
+        options: [Dev, Test, Prod, all]
+        default: Dev
+      dry_run:
+        description: "Solo evaluar el gate, sin disparar despliegues"
+        type: boolean
+        default: true
+      run_scan:
+        description: "Reescanear cada artefacto (mas lento)"
+        type: boolean
+        default: false
 
-env:
-  REGISTRY: harness-registry.example.io
-  APP_REPO: harness-registry.example.io/apps/app1
-
-  # La base image la resuelve el propio build desde la policy de Harness,
-  # así nadie la escribe a mano en el Dockerfile.
-  POLICY_ID: hardened_image_cd
+permissions:
+  contents: read
+  packages: read
 
 jobs:
-  build:
+  # ===========================================================================
+  #  1. El driver file se convierte en matriz
+  # ===========================================================================
+  expand:
     runs-on: ubuntu-latest
     outputs:
-      app_tag: ${{ steps.meta.outputs.app_tag }}
-      base_ref: ${{ steps.base.outputs.base_ref }}
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
     steps:
       - uses: actions/checkout@v4
 
-      # -------------------------------------------------------------------
-      # Misma llamada que hace el gate: una sola fuente de verdad para la
-      # base image, consumida tanto por el build como por la validación.
-      # -------------------------------------------------------------------
-      - name: Resolver base image hardened desde la policy de Harness
-        id: base
-        env:
-          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
-          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
-          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
-          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
+      - name: Instalar PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Expandir el driver file
+        id: build
         run: |
           set -euo pipefail
-          curl -sS --fail-with-body \
-            -H "x-api-key: ${HARNESS_API_KEY}" \
-            "https://app.harness.io/pl/api/v1/policy/${POLICY_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
-            -o policy.json
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          ARGS=("${{ inputs.driver_file }}" "--registry-prefix" "ghcr.io/${OWNER}")
+          if [ "${{ inputs.group }}" != "all" ]; then
+            ARGS+=("--group" "${{ inputs.group }}")
+          fi
 
-          jq -r '.rego' policy.json > policy.rego
+          # Tabla legible en el log: es el "antes" del reporte final.
+          ./scripts/driver_expand.py "${ARGS[@]}" --format table | tee expanded.txt
+          ./scripts/driver_expand.py "${ARGS[@]}" --format matrix > matrix.json
 
-          BASE_REPO=$(grep -A4 '^stable_base' policy.rego | grep '"repo"' | cut -d'"' -f4)
-          BASE_TAG=$(grep -A4 '^stable_base' policy.rego | grep '"tag"' | cut -d'"' -f4)
-          BASE_DIGEST=$(grep -A4 '^stable_base' policy.rego | grep '"digest"' | cut -d'"' -f4)
+          COUNT=$(jq '.include | length' matrix.json)
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "count=${COUNT}"           >> "$GITHUB_OUTPUT"
 
-          echo "base_ref=${BASE_REPO}:${BASE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "base_digest=${BASE_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Base image hardened vigente: ${BASE_REPO}:${BASE_TAG}"
+          {
+            echo "### Driver file expandido"
+            echo ""
+            echo '```'
+            cat expanded.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Metadata
-        id: meta
-        run: echo "app_tag=v$(date +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [ "${COUNT}" -eq 0 ]; then
+            echo "::warning::No hay entradas habilitadas en el grupo ${{ inputs.group }}."
+          fi
+
+  # ===========================================================================
+  #  2. Una entrada por runner. El gate primero; el despliegue solo si pasa.
+  # ===========================================================================
+  gate:
+    needs: expand
+    if: needs.expand.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # una entrada bloqueada no puede tumbar la flota
+      # Fijo a proposito: GitHub Actions no admite expresiones en max-parallel.
+      # El equivalente configurable esta en scripts/mass_deploy.sh --parallel N.
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.expand.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar herramientas
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -sSL -o "${RUNNER_TEMP}/bin/opa" \
+            https://openpolicyagent.org/downloads/v0.68.0/opa_linux_amd64_static
+          curl -sSL "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}/bin" crane
+          chmod +x "${RUNNER_TEMP}/bin/opa" "${RUNNER_TEMP}/bin/crane"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
 
       - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USER }}
-          password: ${{ secrets.REGISTRY_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # -------------------------------------------------------------------
-      # LA PIEZA CLAVE: los labels org.opencontainers.image.base.*
-      # Sin esto el gate de CD falla por la regla [A1] (fallo cerrado).
-      #
-      # El Dockerfile debe declarar:  ARG BASE_IMAGE
-      #                               FROM ${BASE_IMAGE}
-      # -------------------------------------------------------------------
-      - name: Build y push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          build-args: |
-            BASE_IMAGE=${{ steps.base.outputs.base_ref }}
-          tags: ${{ env.APP_REPO }}:${{ steps.meta.outputs.app_tag }}
-          labels: |
-            org.opencontainers.image.base.name=${{ steps.base.outputs.base_ref }}
-            org.opencontainers.image.base.digest=${{ steps.base.outputs.base_digest }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-
-  # =====================================================================
-  # Disparo del CD en Harness. Nadie copia tags a mano en la consola:
-  # el tag construido viaja en el body de la llamada.
-  # =====================================================================
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Disparar pipeline de CD en Harness
+      - name: Descargar la policy
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
           HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
           HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
           HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
-          APP_TAG: ${{ needs.build.outputs.app_tag }}
         run: |
           set -euo pipefail
+          if [ -n "${HARNESS_API_KEY:-}" ]; then
+            POLICY_SOURCE=harness OUT_DIR=facts ./scripts/fetch_policy.sh
+          else
+            POLICY_SOURCE=local OUT_DIR=facts ./scripts/fetch_policy.sh
+          fi
 
-          cat > runtime-inputs.yaml <<EOF
-          pipeline:
-            identifier: cd_deploy_policy_gate
-            variables:
-              - name: app_image_repo
-                type: String
-                value: ${APP_REPO}
-              - name: app_image_tag
-                type: String
-                value: ${APP_TAG}
-              - name: env_type
-                type: String
-                value: PreProduction
-              - name: change_number
-                type: String
-                value: ""
-              - name: run_artifact_scan
-                type: String
-                value: "true"
-          EOF
+      - name: Gate de hardening
+        id: gate
+        continue-on-error: true # el veredicto se agrega en el reporte
+        env:
+          APP_REPO: ${{ matrix.app_image_repo }}
+          APP_TAG: ${{ matrix.app_image_tag }}
+          ENV_TYPE: ${{ matrix.env_type }}
+          CHANGE_NUMBER: ${{ matrix.change_number }}
+          DEPLOY_PARAMS: ${{ matrix.deploy_params }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          OUT_DIR=facts ./scripts/resolve_base_image.sh || \
+            echo '{"present":false,"repo":"","tag":"","digest":""}' > facts/base.json
+
+          if [ "${{ inputs.run_scan }}" = "true" ]; then
+            command -v trivy >/dev/null 2>&1 || {
+              curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v0.55.2/trivy_0.55.2_Linux-64bit.tar.gz" \
+                | tar -xz -C "${RUNNER_TEMP}/bin" trivy
+            }
+            OUT_DIR=facts ./scripts/scan_app_image.sh || echo "Escaneo no disponible."
+          fi
+
+          OUT_DIR=facts POLICY=facts/policy.rego ./scripts/evaluate_gate.sh
+
+      - name: Registrar el veredicto
+        id: verdict
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          CODES=""
+          if [ -f facts/decision.json ]; then
+            CODES=$(jq -r '[.result[0].expressions[0].value[]?] | .[]' facts/decision.json \
+              | grep -o '^\[[A-C][0-9]\]' | tr -d '[]' | sort -u | tr '\n' ' ' | sed 's/ $//')
+          fi
+          VERDICT="PASSED"
+          [ "${{ steps.gate.outcome }}" = "success" ] || VERDICT="BLOCKED"
+
+          jq -n \
+            --arg id      "${{ matrix.id }}" \
+            --arg ref     "${{ matrix.app_image_repo }}:${{ matrix.app_image_tag }}" \
+            --arg verdict "${VERDICT}" \
+            --arg codes   "${CODES}" \
+            --arg pipe    "${{ matrix.pipeline_id }}" \
+            '{id:$id, ref:$ref, verdict:$verdict, codes:$codes, pipeline_id:$pipe, deployed:false}' \
+            > "results/${{ matrix.id }}.json"
+
+          echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.id }} -> ${VERDICT} ${CODES}"
+
+      # ---------------------------------------------------------------------
+      #  Solo si el gate paso: se ejecuta SU pipeline con SU input set.
+      #  El pipeline del cliente se invoca tal cual, sin haberlo modificado.
+      # ---------------------------------------------------------------------
+      - name: Disparar el despliegue en Harness
+        if: steps.verdict.outputs.verdict == 'PASSED' && inputs.dry_run != true
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
+          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
+          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HARNESS_API_KEY:-}" ]; then
+            echo "::warning::Sin HARNESS_API_KEY: no se dispara ${{ matrix.pipeline_id }}."
+            exit 0
+          fi
+
+          URL="https://app.harness.io/pipeline/api/pipeline/execute/${{ matrix.pipeline_id }}/inputSetList"
+          URL="${URL}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}"
 
           RESP=$(curl -sS --fail-with-body -X POST \
             -H "x-api-key: ${HARNESS_API_KEY}" \
-            -H "Content-Type: application/yaml" \
-            "https://app.harness.io/pipeline/api/pipeline/execute/cd_deploy_policy_gate?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
-            --data-binary @runtime-inputs.yaml)
+            -H "Content-Type: application/json" \
+            "${URL}" \
+            --data-binary "$(jq -n --arg is '${{ matrix.input_set_id }}' '{inputSetReferences:[$is]}')")
 
-          EXEC_ID=$(echo "$RESP" | jq -r '.data.planExecution.uuid')
-          echo "Ejecución de Harness: ${EXEC_ID}"
-          echo "$EXEC_ID" > exec_id.txt
+          EXEC_ID=$(echo "${RESP}" | jq -r '.data.planExecution.uuid // .data.planExecutionId // empty')
+          if [ -z "${EXEC_ID}" ]; then
+            echo "::error::No pude disparar ${{ matrix.pipeline_id }}."
+            echo "${RESP}" | head -c 600
+            exit 1
+          fi
+          echo "Despliegue disparado: ${{ matrix.pipeline_id }} -> ${EXEC_ID}"
 
-      # -----------------------------------------------------------------
-      # Polling: el control vuelve a GitHub Actions con el resultado real
-      # del despliegue. Esto es lo que pedía Anil (min 39:38): no tener
-      # que entrar a la consola de Harness para saber si pasó o falló.
-      # -----------------------------------------------------------------
-      - name: Esperar resultado del despliegue
-        env:
-          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
-          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
-          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
-          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
+          jq --arg e "${EXEC_ID}" '.deployed = true | .execution_id = $e' \
+            "results/${{ matrix.id }}.json" > tmp.json
+          mv tmp.json "results/${{ matrix.id }}.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.id }}
+          path: results/*.json
+          retention-days: 5
+
+  # ===========================================================================
+  #  3. UN reporte de toda la flota.
+  #     Si 50 de 100 apps se construyeron sobre una base retirada, salen las 50
+  #     aqui, en una sola ejecucion, en lugar de fallar de a una.
+  # ===========================================================================
+  report:
+    needs: [expand, gate]
+    if: always() && needs.expand.outputs.count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+
+      - name: Reporte de la flota
         run: |
           set -euo pipefail
-          EXEC_ID=$(cat exec_id.txt)
+          jq -s '.' results/*.json > report.json
+          PASSED=$(jq '[.[] | select(.verdict=="PASSED")] | length' report.json)
+          BLOCKED=$(jq '[.[] | select(.verdict=="BLOCKED")] | length' report.json)
+          DEPLOYED=$(jq '[.[] | select(.deployed==true)] | length' report.json)
 
-          for i in $(seq 1 120); do
-            STATUS=$(curl -sS \
-              -H "x-api-key: ${HARNESS_API_KEY}" \
-              "https://app.harness.io/pipeline/api/pipelines/execution/v2/${EXEC_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
-              | jq -r '.data.pipelineExecutionSummary.status')
+          {
+            echo "### Reporte de la flota"
+            echo ""
+            echo "| entrada | artefacto | veredicto | reglas | pipeline |"
+            echo "|---|---|---|---|---|"
+            jq -r '.[] | "| \(.id) | `\(.ref)` | \(.verdict) | \(if .codes == "" then "-" else .codes end) | \(.pipeline_id) |"' report.json
+            echo ""
+            echo "**${PASSED} aprobadas · ${BLOCKED} bloqueadas · ${DEPLOYED} despliegues disparados**"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-            echo "[$i] Estado: ${STATUS}"
-
-            case "${STATUS}" in
-              Success)
-                echo "Despliegue completado."
-                exit 0 ;;
-              Failed|Aborted|Errored|Expired|ApprovalRejected)
-                echo "::error::El despliegue terminó en estado ${STATUS}. Revisa el gate de hardening."
-                exit 1 ;;
-            esac
-            sleep 15
-          done
-
-          echo "::error::Timeout esperando el despliegue."
-          exit 1
+          if [ "${BLOCKED}" -gt 0 ]; then
+            echo "::error::${BLOCKED} entradas bloqueadas por la policy de hardening."
+            exit 1
+          fi
