@@ -315,22 +315,35 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  #  deploy — dispara SOLO el stage "CD" del pipeline de Harness.
+  #  deploy — dispara el pipeline de Harness para que corra (solo) el CD.
   #
-  #  Importante: esto NO ejecuta el pipeline completo. Si lo hiciera, Harness
-  #  volvería a correr el stage "Build_and_Push" (que ya hicimos aquí en
-  #  GitHub Actions) con su propio <+pipeline.sequenceId>, produciendo OTRO
-  #  artefacto distinto al que acabamos de publicar. Por eso se usa el
-  #  endpoint que permite seleccionar stages puntuales:
+  #  CAMBIO DE ENFOQUE: el endpoint de "Execute Specific Stages"
+  #  (POST /pipeline/api/pipeline/execute/{id}/stages) devuelve 400:
+  #    "Stage executions are not allowed for pipeline [Build_and_Push_Post_Hardening]"
+  #  Harness exige activar "Allow selective stage(s) executions" en el
+  #  pipeline (Pipeline Studio -> Advanced Options -> Stage Execution
+  #  Settings) antes de permitir ese endpoint, y por decisión explícita se
+  #  deja esa configuración del pipeline real tal como está — sin tocarla.
   #
-  #    POST /pipeline/api/pipeline/execute/{identifier}/stages
-  #    body: {"runtimeInputYaml": "...", "stageIdentifiers": ["CD"], "expressionValues": {}}
+  #  Por eso este job ahora usa el endpoint de ejecución NORMAL (pipeline
+  #  completo), confirmado en https://apidocs.harness.io/pipeline-execute:
   #
-  #  Confirmado en la documentación de Harness ("Execute Specific Stages",
-  #  https://apidocs.harness.io/pipeline-execute). Lo que la documentación NO
-  #  dice es si hace falta el prefijo /gateway (con /pm/api/v1/policies sí
-  #  hacía falta, aunque la doc tampoco lo mencionaba) — por eso el primer
-  #  step prueba ambos y usa el que responda 200, en vez de asumir.
+  #    POST /pipeline/api/pipeline/execute/{identifier}
+  #    body: {"runtimeInputYaml": "..."}
+  #
+  #  OJO — esto es una diferencia de comportamiento real, no solo de URL:
+  #  Harness va a querer correr TAMBIÉN "Download_Policy" y "Build_and_Push",
+  #  no solo "CD". Por eso el template de runtime inputs ahora se pide para
+  #  las 3 stages (no solo CD), y el script de abajo revisa que no quede
+  #  ningún '<+input>' sin resolver en NINGUNA stage antes de mandar el
+  #  request — si "Download_Policy" o "Build_and_Push" piden algo que no
+  #  sepamos rellenar, el job falla con la ruta exacta impresa en vez de
+  #  mandar un runtime input incompleto y que Harness lo rechace con un
+  #  mensaje más críptico.
+  #
+  #  Si en algún momento se prefiere volver a que SOLO corra CD sin repetir
+  #  el build, la alternativa sigue siendo activar ese toggle en el pipeline
+  #  — un checkbox en Harness, no un cambio en este Action.
   #
   #  LA PARTE QUE NO PUDE INVENTAR — ya confirmada contra tu Service real:
   #
@@ -369,7 +382,7 @@ jobs:
       APP_TAG: ${{ needs.build.outputs.app_tag }}
       APP_REPO: ${{ needs.build.outputs.app_repo }}
     steps:
-      - name: Obtener el template de runtime inputs del stage CD
+      - name: Obtener el template de runtime inputs del pipeline completo
         id: template
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -381,7 +394,7 @@ jobs:
               -H "x-api-key: ${HARNESS_API_KEY}" \
               -H "Content-Type: application/json" \
               "https://app.harness.io${PREFIX}/pipeline/api/inputSets/template?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&pipelineIdentifier=${HARNESS_PIPELINE_ID}" \
-              -d '{"stageIdentifiers": ["CD"]}')"
+              -d '{"stageIdentifiers": ["Download_Policy", "Build_and_Push", "CD"]}')"
             echo "Prefijo '${PREFIX}' -> HTTP ${CODE}"
             if [ "${CODE}" = "200" ]; then
               FOUND_PREFIX="${PREFIX}"
@@ -403,14 +416,21 @@ jobs:
 
           echo "prefix=${FOUND_PREFIX}" >> "$GITHUB_OUTPUT"
           echo "${TEMPLATE_YAML}" > template.yaml
-          echo "--- Template de runtime inputs (stage CD) ---"
+          echo "--- Template de runtime inputs (pipeline completo) ---"
           cat template.yaml
 
       # -----------------------------------------------------------------
-      #  Ver la nota grande de arriba: forma confirmada contra el YAML real
-      #  del Service "TEST" (una source, type 'Har', anidada spec.spec).
-      #  Si algo no calza con eso, este step falla con el template completo
-      #  ya impreso arriba para que me lo pases, en vez de adivinar.
+      #  CD: forma confirmada contra el YAML real del Service "TEST" (una
+      #  source, type 'Har', anidada spec.spec). Si algo no calza con eso,
+      #  este step falla con el template completo ya impreso arriba.
+      #
+      #  Download_Policy / Build_and_Push: como ahora se ejecuta el
+      #  pipeline completo (ver nota grande arriba), estas stages también
+      #  van a pedir sus propios runtime inputs si tienen. No sé de
+      #  antemano cuáles son, así que después de resolver CD, el script
+      #  escanea TODO lo que quede — si sobra algún '<+input>' sin resolver
+      #  en cualquier stage, falla con la ruta exacta en vez de mandarle a
+      #  Harness un runtime input a medias.
       # -----------------------------------------------------------------
       - name: Insertar el tag nuevo en el runtime input
         id: build_input
@@ -520,16 +540,52 @@ jobs:
               print(f"::error::'sources' no es ni '<+input>' completo ni una lista de 1 elemento (valor recibido: {sources!r}). Pega el template.yaml de arriba para ajustar esto.")
               sys.exit(1)
 
+          # Ahora se ejecuta el pipeline COMPLETO (ver nota grande arriba), así
+          # que Download_Policy y Build_and_Push también van a estar en este
+          # árbol y pueden tener sus propios '<+input>' sin resolver — no sé
+          # de antemano cuáles. En vez de mandarle a Harness un runtime input
+          # a medias (que rechazaría con un mensaje menos claro que este),
+          # se escanea TODO el árbol buscando cualquier '<+input>' que haya
+          # quedado sin tocar, y se falla con la ruta exacta de cada uno.
+          def find_unresolved(node, path="pipeline"):
+              found = []
+              if isinstance(node, dict):
+                  for k, v in node.items():
+                      found += find_unresolved(v, f"{path}.{k}")
+              elif isinstance(node, list):
+                  for i, v in enumerate(node):
+                      found += find_unresolved(v, f"{path}[{i}]")
+              elif isinstance(node, str) and node.strip().startswith("<+input>"):
+                  found.append((path, node))
+              return found
+
+          unresolved = find_unresolved(pipeline)
+          if unresolved:
+              print("::error::Quedaron runtime inputs sin resolver fuera del stage CD (o dentro, si algo se me pasó). No mando esto a Harness a medias:")
+              for path, value in unresolved:
+                  print(f"  {path} = {value}")
+              print("Pega esta lista (o el template.yaml de arriba) para que ajuste el script y les dé un valor real.")
+              sys.exit(1)
+
           with open("runtime_input.yaml", "w") as f:
               yaml.safe_dump({"pipeline": pipeline}, f, sort_keys=False)
 
-          print("runtime_input.yaml armado correctamente.")
+          print("runtime_input.yaml armado correctamente, sin '<+input>' pendientes.")
           PY
 
           echo "--- runtime_input.yaml ---"
           cat runtime_input.yaml
 
-      - name: Disparar el stage CD en Harness
+      # -----------------------------------------------------------------
+      #  Endpoint de ejecución NORMAL (pipeline completo), sin '/stages':
+      #  el pipeline no tiene habilitado "Allow selective stage(s)
+      #  executions", así que el endpoint de stage puntual devuelve 400
+      #  ("Stage executions are not allowed for pipeline [...]"). Confirmado
+      #  en https://apidocs.harness.io/pipeline-execute. El body ya no lleva
+      #  'stageIdentifiers' ni 'expressionValues' — solo 'runtimeInputYaml',
+      #  que es lo único que ese endpoint espera.
+      # -----------------------------------------------------------------
+      - name: Disparar el pipeline completo en Harness
         id: trigger
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -540,15 +596,15 @@ jobs:
           BODY_FILE="$(mktemp)"
           jq -n \
             --rawfile yaml runtime_input.yaml \
-            '{runtimeInputYaml: $yaml, stageIdentifiers: ["CD"], expressionValues: {}}' \
+            '{runtimeInputYaml: $yaml}' \
             > "${BODY_FILE}"
 
           curl -sS --fail-with-body -o exec_response.json -X POST \
             -H "x-api-key: ${HARNESS_API_KEY}" \
             -H "Content-Type: application/json" \
-            "https://app.harness.io${PREFIX}/pipeline/api/pipeline/execute/${HARNESS_PIPELINE_ID}/stages?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&moduleType=CD" \
+            "https://app.harness.io${PREFIX}/pipeline/api/pipeline/execute/${HARNESS_PIPELINE_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&moduleType=CD" \
             -d @"${BODY_FILE}" || {
-              echo "::error::curl falló disparando el stage CD. Respuesta:"
+              echo "::error::curl falló disparando el pipeline. Respuesta:"
               cat exec_response.json 2>/dev/null || true
               exit 1
             }
@@ -561,13 +617,15 @@ jobs:
           fi
 
           echo "exec_id=${EXEC_ID}" >> "$GITHUB_OUTPUT"
-          echo "Ejecución del stage CD disparada: ${EXEC_ID}"
+          echo "Ejecución del pipeline disparada: ${EXEC_ID}"
 
       # -----------------------------------------------------------------
       #  El control vuelve a GitHub Actions con el resultado real — no hace
-      #  falta entrar a la consola de Harness para saber si el CD pasó.
+      #  falta entrar a la consola de Harness para saber si terminó bien.
+      #  Es el status del PIPELINE completo (Download_Policy + Build_and_Push
+      #  + CD), ya no solo del stage CD, porque ahora se ejecuta todo junto.
       # -----------------------------------------------------------------
-      - name: Esperar resultado del stage CD
+      - name: Esperar resultado de la ejecución
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
         run: |
@@ -585,14 +643,14 @@ jobs:
 
             case "${STATUS}" in
               Success)
-                echo "Stage CD completado."
+                echo "Pipeline completado (Download_Policy + Build_and_Push + CD)."
                 exit 0 ;;
               Failed|Aborted|Errored|Expired|ApprovalRejected)
-                echo "::error::El stage CD terminó en ${STATUS}. Revisa la ejecución en Harness."
+                echo "::error::La ejecución terminó en ${STATUS}. Revisa el pipeline en Harness — puede haber fallado en Download_Policy o Build_and_Push, no necesariamente en CD."
                 exit 1 ;;
             esac
             sleep 15
           done
 
-          echo "::error::Timeout esperando el stage CD."
+          echo "::error::Timeout esperando la ejecución del pipeline."
           exit 1
