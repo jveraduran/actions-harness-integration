@@ -52,11 +52,11 @@ on:
 
 env:
   REGISTRY: pkg.harness.io
-  ACCOUNT_ID: ucbjyokwry69wqkdogpexg
+  ACCOUNT_ID: UCBJyOkwRy69wQkDOgpexg
   HARNESS_ORG_ID: TPMDemos
   HARNESS_PROJECT_ID: devops
   REGISTRY_REF: harness-demo
-  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardening-reader-1-nodejs
+  APP_REPO: pkg.harness.io/UCBJyOkwRy69wQkDOgpexg/harness-demo/hardening-reader-1-nodejs
 
   # AJUSTA: "DEBUG" es el identificador literal que usa hoy tu pipeline de
   # Harness. Si es una policy de prueba y no la definitiva para el demo,
