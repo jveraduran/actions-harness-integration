@@ -378,7 +378,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     env:
-      HARNESS_PIPELINE_ID: Build_and_Push_Post_Hardening
+      HARNESS_PIPELINE_ID: cd_deploy_policy_gate
       APP_TAG: ${{ needs.build.outputs.app_tag }}
       APP_REPO: ${{ needs.build.outputs.app_repo }}
     steps:
