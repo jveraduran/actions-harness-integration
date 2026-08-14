@@ -17,10 +17,11 @@
 #      BuildAndPushDockerRegistry    -> docker/build-push-action
 #
 #    Harness "CD" (stage Deployment, K8sRollingDeploy)
-#      -> NO está en este workflow. Ese stage de tu pipeline hoy no tiene
-#         ningún gate de policy, solo despliega. Si migras únicamente el
-#         tramo de CI a GitHub Actions y dejas el CD donde está en Harness,
-#         no hace falta que este workflow dispare nada más.
+#      -> job "deploy" de este workflow. NO se re-ejecuta el pipeline
+#         completo (eso duplicaría el build). Se dispara SOLO el stage CD
+#         vía la API de "Execute Specific Stages", pasándole el tag/repo
+#         que este mismo workflow acaba de construir y publicar. Ver el
+#         comentario grande sobre el job "deploy" más abajo.
 #
 #  Valores reales confirmados por el pipeline de Harness que pegaste:
 #    registry     : pkg.harness.io
@@ -75,6 +76,7 @@ jobs:
     outputs:
       app_tag: ${{ steps.tag.outputs.app_tag }}
       base_tag: ${{ steps.base.outputs.base_tag }}
+      app_repo: ${{ steps.repo.outputs.app_repo }}
     steps:
       - uses: actions/checkout@v4
 
@@ -313,13 +315,228 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  #  No incluido: el disparo del stage "CD" de Harness.
+  #  deploy — dispara SOLO el stage "CD" del pipeline de Harness.
   #
-  #  Tu pipeline de Harness ya hace CD dentro de la misma ejecución (stage
-  #  Deployment con K8sRollingDeploy), así que no hace falta que GitHub
-  #  Actions dispare nada por separado si el resto del pipeline se deja
-  #  intacto y solo migras el tramo de CI. Si en algún momento quieres que
-  #  TODO el flujo (CI + CD) viva en GitHub Actions y llame a Harness solo
-  #  para el despliegue, dilo y agrego el job de trigger + polling que tenía
-  #  la versión anterior de este workflow.
+  #  Importante: esto NO ejecuta el pipeline completo. Si lo hiciera, Harness
+  #  volvería a correr el stage "Build_and_Push" (que ya hicimos aquí en
+  #  GitHub Actions) con su propio <+pipeline.sequenceId>, produciendo OTRO
+  #  artefacto distinto al que acabamos de publicar. Por eso se usa el
+  #  endpoint que permite seleccionar stages puntuales:
+  #
+  #    POST /pipeline/api/pipeline/execute/{identifier}/stages
+  #    body: {"runtimeInputYaml": "...", "stageIdentifiers": ["CD"], "expressionValues": {}}
+  #
+  #  Confirmado en la documentación de Harness ("Execute Specific Stages",
+  #  https://apidocs.harness.io/pipeline-execute). Lo que la documentación NO
+  #  dice es si hace falta el prefijo /gateway (con /pm/api/v1/policies sí
+  #  hacía falta, aunque la doc tampoco lo mencionaba) — por eso el primer
+  #  step prueba ambos y usa el que responda 200, en vez de asumir.
+  #
+  #  LA PARTE QUE NO PUDE INVENTAR: tu stage CD tiene
+  #    service.serviceInputs.serviceDefinition.spec.artifacts.primary
+  #  con primaryArtifactRef y sources en <+input> — la forma exacta depende
+  #  de cómo configuraste el Service "TEST" en Harness (cuántas artifact
+  #  sources tiene, sus identifiers, el nombre del campo de tag), y eso no lo
+  #  tengo. En vez de adivenarlo, este job PIDE el template real a Harness
+  #  (POST /pipeline/api/inputSets/template, confirmado en
+  #  https://apidocs.harness.io/pipeline-input-set/runtimeinputtemplate) y
+  #  completa el tag ahí con una heurística: asume que hay EXACTAMENTE una
+  #  artifact source y que su campo de tag se llama 'tag'. Si tu Service
+  #  tiene otra forma, el step de abajo va a fallar con un mensaje explícito
+  #  y el template completo en el log — pégamelo y ajusto el script en vez de
+  #  dejar que despliegue algo adivinado.
   # =========================================================================
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      HARNESS_PIPELINE_ID: Build_and_Push_Post_Hardening
+      APP_TAG: ${{ needs.build.outputs.app_tag }}
+      APP_REPO: ${{ needs.build.outputs.app_repo }}
+    steps:
+      - name: Obtener el template de runtime inputs del stage CD
+        id: template
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          FOUND_PREFIX=""
+          for PREFIX in "/gateway" ""; do
+            CODE="$(curl -sS -o response.json -w '%{http_code}' -X POST \
+              -H "x-api-key: ${HARNESS_API_KEY}" \
+              -H "Content-Type: application/json" \
+              "https://app.harness.io${PREFIX}/pipeline/api/inputSets/template?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&pipelineIdentifier=${HARNESS_PIPELINE_ID}" \
+              -d '{"stageIdentifiers": ["CD"]}')"
+            echo "Prefijo '${PREFIX}' -> HTTP ${CODE}"
+            if [ "${CODE}" = "200" ]; then
+              FOUND_PREFIX="${PREFIX}"
+              break
+            fi
+          done
+
+          if [ -z "${FOUND_PREFIX}" ] && [ ! -s response.json ]; then
+            echo "::error::Ningún prefijo respondió 200 para /pipeline/api/inputSets/template."
+            exit 1
+          fi
+
+          TEMPLATE_YAML="$(jq -r '.data.inputSetTemplateYaml // .inputSetTemplateYaml // empty' response.json)"
+          if [ -z "${TEMPLATE_YAML}" ] || [ "${TEMPLATE_YAML}" = "null" ]; then
+            echo "::error::La respuesta no trajo inputSetTemplateYaml. Contenido recibido:"
+            cat response.json
+            exit 1
+          fi
+
+          echo "prefix=${FOUND_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "${TEMPLATE_YAML}" > template.yaml
+          echo "--- Template de runtime inputs (stage CD) ---"
+          cat template.yaml
+
+      # -----------------------------------------------------------------
+      #  Heurística explícita — ver la nota grande de arriba. Si tu Service
+      #  no calza con "una sola artifact source con campo spec.tag", este
+      #  step falla con el template completo ya impreso arriba para que me
+      #  lo pases.
+      # -----------------------------------------------------------------
+      - name: Insertar el tag nuevo en el runtime input
+        id: build_input
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          import yaml
+
+          with open("template.yaml") as f:
+              template = yaml.safe_load(f)
+
+          pipeline = template.get("pipeline", template) if isinstance(template, dict) else None
+          if not pipeline:
+              print("::error::template.yaml no parseó como un dict con 'pipeline'. Revisa el archivo impreso arriba.")
+              sys.exit(1)
+
+          stages = pipeline.get("stages") or []
+          cd_stage = None
+          for s in stages:
+              st = s.get("stage", s) if isinstance(s, dict) else None
+              if st and st.get("identifier") == "CD":
+                  cd_stage = st
+                  break
+
+          if cd_stage is None:
+              ids = [((s.get("stage", s) or {}).get("identifier")) for s in stages]
+              print(f"::error::No encontré un stage con identifier 'CD' en el template. Stages presentes: {ids}")
+              sys.exit(1)
+
+          try:
+              artifacts = cd_stage["service"]["serviceInputs"]["serviceDefinition"]["spec"]["artifacts"]
+              primary = artifacts["primary"]
+          except KeyError as e:
+              print(f"::error::La ruta service.serviceInputs.serviceDefinition.spec.artifacts.primary no existe (falta {e}). Pega el template.yaml de arriba para ajustar esto.")
+              sys.exit(1)
+
+          sources = primary.get("sources")
+          if not sources or len(sources) != 1:
+              n = len(sources) if sources else 0
+              print(f"::error::Esperaba exactamente 1 artifact source, encontré {n}. No puedo elegir sin ambigüedad — pega el template.yaml de arriba.")
+              sys.exit(1)
+
+          source = sources[0]
+          primary["primaryArtifactRef"] = source.get("identifier")
+
+          spec = source.setdefault("spec", {})
+          if "tag" not in spec:
+              print(f"::error::El source no tiene un campo 'tag' bajo spec (tiene: {list(spec.keys())}). Pega el template.yaml de arriba para ajustar el nombre del campo.")
+              sys.exit(1)
+
+          import os
+          spec["tag"] = os.environ["APP_TAG"]
+
+          # Algunos conectores también piden el path/imagen del repo como
+          # runtime input; si aparece con <+input>, se completa con APP_REPO.
+          #
+          # OJO: el chequeo es "key IN spec" antes de mirar su valor. Si se
+          # usara spec.get(key) a secas, un campo que ni existe en el template
+          # (spec.get devuelve None) calzaría igual que uno presente con
+          # '<+input>', y este loop terminaría INYECTANDO claves que Harness
+          # nunca pidió como runtime input. Ya se dio en una prueba con un
+          # template que solo tenía 'tag': salían 'imagePath', 'repository' y
+          # 'artifactPath' de la nada en el runtime_input.yaml final.
+          for key in ("imagePath", "repository", "artifactPath"):
+              if key in spec and spec[key] in ("<+input>", None, ""):
+                  spec[key] = os.environ["APP_REPO"]
+
+          with open("runtime_input.yaml", "w") as f:
+              yaml.safe_dump({"pipeline": pipeline}, f, sort_keys=False)
+
+          print("runtime_input.yaml armado correctamente.")
+          PY
+
+          echo "--- runtime_input.yaml ---"
+          cat runtime_input.yaml
+
+      - name: Disparar el stage CD en Harness
+        id: trigger
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.template.outputs.prefix }}"
+
+          BODY_FILE="$(mktemp)"
+          jq -n \
+            --rawfile yaml runtime_input.yaml \
+            '{runtimeInputYaml: $yaml, stageIdentifiers: ["CD"], expressionValues: {}}' \
+            > "${BODY_FILE}"
+
+          curl -sS --fail-with-body -o exec_response.json -X POST \
+            -H "x-api-key: ${HARNESS_API_KEY}" \
+            -H "Content-Type: application/json" \
+            "https://app.harness.io${PREFIX}/pipeline/api/pipeline/execute/${HARNESS_PIPELINE_ID}/stages?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&moduleType=CD" \
+            -d @"${BODY_FILE}" || {
+              echo "::error::curl falló disparando el stage CD. Respuesta:"
+              cat exec_response.json 2>/dev/null || true
+              exit 1
+            }
+
+          EXEC_ID="$(jq -r '.data.planExecution.uuid // empty' exec_response.json)"
+          if [ -z "${EXEC_ID}" ]; then
+            echo "::error::No pude extraer planExecution.uuid. Respuesta completa:"
+            cat exec_response.json
+            exit 1
+          fi
+
+          echo "exec_id=${EXEC_ID}" >> "$GITHUB_OUTPUT"
+          echo "Ejecución del stage CD disparada: ${EXEC_ID}"
+
+      # -----------------------------------------------------------------
+      #  El control vuelve a GitHub Actions con el resultado real — no hace
+      #  falta entrar a la consola de Harness para saber si el CD pasó.
+      # -----------------------------------------------------------------
+      - name: Esperar resultado del stage CD
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.template.outputs.prefix }}"
+          EXEC_ID="${{ steps.trigger.outputs.exec_id }}"
+
+          for i in $(seq 1 120); do
+            STATUS="$(curl -sS \
+              -H "x-api-key: ${HARNESS_API_KEY}" \
+              "https://app.harness.io${PREFIX}/pipeline/api/pipelines/execution/v2/${EXEC_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
+              | jq -r '.data.pipelineExecutionSummary.status // "Unknown"')"
+
+            echo "[$i] Estado: ${STATUS}"
+
+            case "${STATUS}" in
+              Success)
+                echo "Stage CD completado."
+                exit 0 ;;
+              Failed|Aborted|Errored|Expired|ApprovalRejected)
+                echo "::error::El stage CD terminó en ${STATUS}. Revisa la ejecución en Harness."
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+
+          echo "::error::Timeout esperando el stage CD."
+          exit 1
