@@ -1,0 +1,7 @@
+# Valores por defecto que Harness sobreescribe en tiempo de despliegue.
+# `image` lo resuelve Harness desde el artefacto del servicio.
+name: app1
+replicas: 2
+image: <+artifact.image>
+dockerconfigjson: <+artifact.imagePullSecret>
+release: <+env.name>-<+service.name>

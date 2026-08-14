@@ -1,0 +1,53 @@
+// ==========================================================================
+//  Variante Gradle del mismo artefacto.
+//
+//  Para usarla: copia build.gradle y settings.gradle a la raíz del repo y usa
+//  Dockerfile.gradle en lugar del Dockerfile de Maven. Sirve para el demo de
+//  Maven + Gradle que ya presentaste (min 23:20) reutilizando este mismo repo.
+// ==========================================================================
+
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'io.harness.demo'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+application {
+    mainClass = 'io.harness.demo.Application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
+}
+
+jar {
+    // Mismo nombre de salida que Maven (app.jar) para que el Dockerfile solo
+    // cambie en la ruta, no en el nombre del artefacto.
+    archiveFileName = 'app.jar'
+    manifest {
+        attributes(
+            'Main-Class': 'io.harness.demo.Application',
+            'Implementation-Version': project.version
+        )
+    }
+}

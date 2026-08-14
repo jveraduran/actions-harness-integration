@@ -1,0 +1,40 @@
+# ===========================================================================
+#  Variante Gradle. Idéntica al Dockerfile de Maven salvo el stage de build.
+#  El stage de runtime y los labels son exactamente los mismos, que es lo
+#  único que le importa al gate de CD.
+# ===========================================================================
+ARG BASE_IMAGE
+
+FROM gradle:8.10-jdk17 AS build
+
+WORKDIR /src
+
+COPY settings.gradle build.gradle ./
+RUN gradle --no-daemon dependencies --quiet || true
+
+COPY src ./src
+RUN gradle --no-daemon clean build --quiet
+
+FROM ${BASE_IMAGE} AS runtime
+
+ARG BASE_IMAGE
+ARG BASE_DIGEST=""
+ARG APP_VERSION="dev"
+ARG GIT_SHA=""
+
+LABEL org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.title="app1"
+
+ENV BASE_IMAGE_NAME="${BASE_IMAGE}" \
+    BASE_IMAGE_DIGEST="${BASE_DIGEST}"
+
+WORKDIR /app
+COPY --from=build /src/build/libs/app.jar /app/app.jar
+
+USER 10001
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]

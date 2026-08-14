@@ -1,0 +1,71 @@
+# ===========================================================================
+#  Manifiesto que consume el stage de Deployment de Harness.
+#
+#  Las expresiones <+...> las resuelve Harness en tiempo de despliegue:
+#  el artefacto viene del servicio, no está escrito aquí. Si el gate bloquea,
+#  este manifiesto nunca se aplica.
+# ===========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{.Values.name}}
+  labels:
+    app: {{.Values.name}}
+    harness.io/release: {{.Values.release}}
+spec:
+  replicas: {{int .Values.replicas}}
+  selector:
+    matchLabels:
+      app: {{.Values.name}}
+  template:
+    metadata:
+      labels:
+        app: {{.Values.name}}
+        harness.io/release: {{.Values.release}}
+      annotations:
+        # Trazabilidad en el cluster: qué base image trae este pod.
+        # Lo escribe el gate, así que un `kubectl describe` responde la
+        # pregunta sin ir al registry.
+        harness.io/base-image: "<+pipeline.stages.predeploy_gate.spec.execution.steps.fetch_policy.output.outputVariables.STABLE_BASE_REPO>:<+pipeline.stages.predeploy_gate.spec.execution.steps.fetch_policy.output.outputVariables.STABLE_BASE_TAG>"
+        harness.io/gate-result: "<+pipeline.stages.predeploy_gate.spec.execution.steps.evaluate_gate.output.outputVariables.GATE_RESULT>"
+    spec:
+      {{- if .Values.dockerconfigjson}}
+      imagePullSecrets:
+      - name: {{.Values.name}}-dockercfg
+      {{- end}}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: app
+        image: {{.Values.image}}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
