@@ -332,19 +332,34 @@ jobs:
   #  hacía falta, aunque la doc tampoco lo mencionaba) — por eso el primer
   #  step prueba ambos y usa el que responda 200, en vez de asumir.
   #
-  #  LA PARTE QUE NO PUDE INVENTAR: tu stage CD tiene
-  #    service.serviceInputs.serviceDefinition.spec.artifacts.primary
-  #  con primaryArtifactRef y sources en <+input> — la forma exacta depende
-  #  de cómo configuraste el Service "TEST" en Harness (cuántas artifact
-  #  sources tiene, sus identifiers, el nombre del campo de tag), y eso no lo
-  #  tengo. En vez de adivenarlo, este job PIDE el template real a Harness
-  #  (POST /pipeline/api/inputSets/template, confirmado en
-  #  https://apidocs.harness.io/pipeline-input-set/runtimeinputtemplate) y
-  #  completa el tag ahí con una heurística: asume que hay EXACTAMENTE una
-  #  artifact source y que su campo de tag se llama 'tag'. Si tu Service
-  #  tiene otra forma, el step de abajo va a fallar con un mensaje explícito
-  #  y el template completo en el log — pégamelo y ajusto el script en vez de
-  #  dejar que despliegue algo adivinado.
+  #  LA PARTE QUE NO PUDE INVENTAR — ya confirmada contra tu Service real:
+  #
+  #  El template de runtime inputs del stage CD trae el stage anidado en
+  #  stage.spec.service (no stage.service directo), y en tu Service "TEST"
+  #  el campo 'sources' de artifacts.primary viene marcado COMPLETO como
+  #  '<+input>' (el string, no una lista con un elemento adentro) — Harness
+  #  hace esto cuando cualquier campo dentro de un array es runtime input:
+  #  no puede templatizar el array parcialmente, así que templatiza el
+  #  array entero. Confirmaste el YAML real del Service: una sola source,
+  #  identifier 'Harness', type 'Har' (Harness Artifact Registry nativo),
+  #  con esta forma:
+  #
+  #    sources:
+  #      - identifier: Harness
+  #        type: Har
+  #        spec:
+  #          registryRef: <+input>      # = REGISTRY_REF (harness-demo)
+  #          type: docker               # fijo, no es runtime input
+  #          spec:
+  #            imagePath: <+input>      # = último segmento de APP_REPO
+  #            tag: <+input>            # = APP_TAG
+  #            digest: ""               # fijo, no es runtime input
+  #
+  #  El step de abajo reconstruye exactamente esa forma. Si el Service
+  #  cambia (otro tipo de source, más de una, u otro campo runtime), el
+  #  script detecta que 'sources' ya no es ni '<+input>' completo ni una
+  #  lista de 1 elemento y falla con el template impreso arriba para
+  #  ajustarlo — no intenta adivinar una forma nueva.
   # =========================================================================
   deploy:
     needs: build
@@ -392,16 +407,17 @@ jobs:
           cat template.yaml
 
       # -----------------------------------------------------------------
-      #  Heurística explícita — ver la nota grande de arriba. Si tu Service
-      #  no calza con "una sola artifact source con campo spec.tag", este
-      #  step falla con el template completo ya impreso arriba para que me
-      #  lo pases.
+      #  Ver la nota grande de arriba: forma confirmada contra el YAML real
+      #  del Service "TEST" (una source, type 'Har', anidada spec.spec).
+      #  Si algo no calza con eso, este step falla con el template completo
+      #  ya impreso arriba para que me lo pases, en vez de adivinar.
       # -----------------------------------------------------------------
       - name: Insertar el tag nuevo en el runtime input
         id: build_input
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import os
           import sys
           import yaml
 
@@ -426,43 +442,83 @@ jobs:
               print(f"::error::No encontré un stage con identifier 'CD' en el template. Stages presentes: {ids}")
               sys.exit(1)
 
+          # El template puede anidar 'service' directo bajo el stage, o un
+          # nivel más adentro bajo 'spec' — visto en el template real
+          # (stage.spec.service, no stage.service).
+          service = cd_stage.get("service")
+          if service is None:
+              service = (cd_stage.get("spec") or {}).get("service")
+          if service is None:
+              print(f"::error::No encontré 'service' ni en stage.service ni en stage.spec.service. Claves del stage: {list(cd_stage.keys())}")
+              sys.exit(1)
+
           try:
-              artifacts = cd_stage["service"]["serviceInputs"]["serviceDefinition"]["spec"]["artifacts"]
+              artifacts = service["serviceInputs"]["serviceDefinition"]["spec"]["artifacts"]
               primary = artifacts["primary"]
           except KeyError as e:
               print(f"::error::La ruta service.serviceInputs.serviceDefinition.spec.artifacts.primary no existe (falta {e}). Pega el template.yaml de arriba para ajustar esto.")
               sys.exit(1)
 
+          APP_TAG = os.environ["APP_TAG"]
+          APP_REPO = os.environ["APP_REPO"]
+          REGISTRY_REF = os.environ["REGISTRY_REF"]
+          # imagePath en una source 'Har' es solo el nombre del repo dentro
+          # del registryRef — sin el host ni la cuenta ni el registryRef
+          # mismo (esos ya están implícitos en registryRef). APP_REPO es la
+          # URL completa que usa el build de Docker; el último segmento es
+          # el repo.
+          IMAGE_PATH = APP_REPO.rstrip("/").rsplit("/", 1)[-1]
+
           sources = primary.get("sources")
-          if not sources or len(sources) != 1:
-              n = len(sources) if sources else 0
-              print(f"::error::Esperaba exactamente 1 artifact source, encontré {n}. No puedo elegir sin ambigüedad — pega el template.yaml de arriba.")
+
+          if sources == "<+input>":
+              # Confirmado contra el Service real: una sola source Har,
+              # identifier 'Harness', con registryRef/imagePath/tag anidados
+              # dos niveles de 'spec' adentro. 'type: docker' y 'digest: ""'
+              # son fijos en el Service, no runtime inputs — se preservan.
+              primary["primaryArtifactRef"] = "Harness"
+              primary["sources"] = [
+                  {
+                      "identifier": "Harness",
+                      "type": "Har",
+                      "spec": {
+                          "registryRef": REGISTRY_REF,
+                          "type": "docker",
+                          "spec": {
+                              "imagePath": IMAGE_PATH,
+                              "tag": APP_TAG,
+                              "digest": "",
+                          },
+                      },
+                  }
+              ]
+              print(f"sources reconstruido como Har: registryRef={REGISTRY_REF}, imagePath={IMAGE_PATH}, tag={APP_TAG}")
+
+          elif isinstance(sources, list) and len(sources) == 1:
+              # Fallback por si otro pipeline/Service SÍ templatiza el array
+              # (una source ya presente, con campos individuales en <+input>).
+              source = sources[0]
+              primary["primaryArtifactRef"] = source.get("identifier")
+
+              spec = source.setdefault("spec", {})
+              # Soporta tanto 'spec.tag' plano como el anidado 'spec.spec.tag'
+              # (forma 'Har' con sub-tipo de registro).
+              inner = spec.get("spec") if isinstance(spec.get("spec"), dict) else spec
+
+              if "tag" not in inner:
+                  print(f"::error::No encontré 'tag' ni en spec ni en spec.spec (spec tiene: {list(spec.keys())}). Pega el template.yaml de arriba para ajustar el nombre del campo.")
+                  sys.exit(1)
+              inner["tag"] = APP_TAG
+
+              for key in ("imagePath", "repository", "artifactPath"):
+                  if key in inner and inner[key] in ("<+input>", None, ""):
+                      inner[key] = IMAGE_PATH
+              if "registryRef" in spec and spec["registryRef"] in ("<+input>", None, ""):
+                  spec["registryRef"] = REGISTRY_REF
+
+          else:
+              print(f"::error::'sources' no es ni '<+input>' completo ni una lista de 1 elemento (valor recibido: {sources!r}). Pega el template.yaml de arriba para ajustar esto.")
               sys.exit(1)
-
-          source = sources[0]
-          primary["primaryArtifactRef"] = source.get("identifier")
-
-          spec = source.setdefault("spec", {})
-          if "tag" not in spec:
-              print(f"::error::El source no tiene un campo 'tag' bajo spec (tiene: {list(spec.keys())}). Pega el template.yaml de arriba para ajustar el nombre del campo.")
-              sys.exit(1)
-
-          import os
-          spec["tag"] = os.environ["APP_TAG"]
-
-          # Algunos conectores también piden el path/imagen del repo como
-          # runtime input; si aparece con <+input>, se completa con APP_REPO.
-          #
-          # OJO: el chequeo es "key IN spec" antes de mirar su valor. Si se
-          # usara spec.get(key) a secas, un campo que ni existe en el template
-          # (spec.get devuelve None) calzaría igual que uno presente con
-          # '<+input>', y este loop terminaría INYECTANDO claves que Harness
-          # nunca pidió como runtime input. Ya se dio en una prueba con un
-          # template que solo tenía 'tag': salían 'imagePath', 'repository' y
-          # 'artifactPath' de la nada en el runtime_input.yaml final.
-          for key in ("imagePath", "repository", "artifactPath"):
-              if key in spec and spec[key] in ("<+input>", None, ""):
-                  spec[key] = os.environ["APP_REPO"]
 
           with open("runtime_input.yaml", "w") as f:
               yaml.safe_dump({"pipeline": pipeline}, f, sort_keys=False)
