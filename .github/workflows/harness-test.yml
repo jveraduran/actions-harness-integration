@@ -378,20 +378,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     env:
-      HARNESS_PIPELINE_ID: Build_and_Push_Post_Hardening
+      HARNESS_PIPELINE_ID: cd_deploy_policy_gate
       APP_TAG: ${{ needs.build.outputs.app_tag }}
       APP_REPO: ${{ needs.build.outputs.app_repo }}
     steps:
-      # -----------------------------------------------------------------
-      #  'stageIdentifiers: ["Download_Policy","Build_and_Push","CD"]' dio
-      #  400 ("either don't exist or have been deleted") — esos dos primeros
-      #  identifiers eran mi lectura de nombres descriptivos del pipeline
-      #  pegado hace rato, no confirmados como identifier real (case exacto,
-      #  guiones bajos, etc.). En vez de adivinar de nuevo, se pide el
-      #  template SIN restringir por stage (se omite 'stageIdentifiers' del
-      #  body) — así Harness devuelve el template del pipeline completo con
-      #  los identifiers reales, sea cual sea su forma exacta.
-      # -----------------------------------------------------------------
       - name: Obtener el template de runtime inputs del pipeline completo
         id: template
         env:
@@ -399,24 +389,21 @@ jobs:
         run: |
           set -euo pipefail
           FOUND_PREFIX=""
-          HTTP_CODE=""
           for PREFIX in "/gateway" ""; do
             CODE="$(curl -sS -o response.json -w '%{http_code}' -X POST \
               -H "x-api-key: ${HARNESS_API_KEY}" \
               -H "Content-Type: application/json" \
               "https://app.harness.io${PREFIX}/pipeline/api/inputSets/template?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&pipelineIdentifier=${HARNESS_PIPELINE_ID}" \
-              -d '{}')"
+              -d '{"stageIdentifiers": ["Download_Policy", "Build_and_Push", "CD"]}')"
             echo "Prefijo '${PREFIX}' -> HTTP ${CODE}"
-            HTTP_CODE="${CODE}"
             if [ "${CODE}" = "200" ]; then
               FOUND_PREFIX="${PREFIX}"
               break
             fi
           done
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "::error::Ningún prefijo respondió 200 para /pipeline/api/inputSets/template (último código: ${HTTP_CODE}). Respuesta:"
-            cat response.json 2>/dev/null || true
+          if [ -z "${FOUND_PREFIX}" ] && [ ! -s response.json ]; then
+            echo "::error::Ningún prefijo respondió 200 para /pipeline/api/inputSets/template."
             exit 1
           fi
 
@@ -424,7 +411,6 @@ jobs:
           if [ -z "${TEMPLATE_YAML}" ] || [ "${TEMPLATE_YAML}" = "null" ]; then
             echo "::error::La respuesta no trajo inputSetTemplateYaml. Contenido recibido:"
             cat response.json
-            echo "Si esto vino vacío (sin campo .data), puede ser que el pipeline no tenga NINGÚN runtime input pendiente fuera de lo que ya está fijo — en ese caso el runtimeInputYaml a mandar sería solo el esqueleto del pipeline sin overrides, avísame para ajustar el step siguiente a ese caso."
             exit 1
           fi
 
