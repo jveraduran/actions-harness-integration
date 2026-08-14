@@ -68,7 +68,7 @@ jobs:
           # AJUSTA la ruta al endpoint que ya usas en el gate de CI.
           curl -sS --fail-with-body \
             -H "x-api-key: ${HARNESS_API_KEY}" \
-            "https://app.harness.io/pl/api/v1/policy/${POLICY_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
+            "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
             -o policy.json
 
           jq -r '.rego' policy.json > policy.rego
