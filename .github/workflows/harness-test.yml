@@ -181,7 +181,6 @@ jobs:
       APP_REPO: ${{ needs.build.outputs.app_repo }}
       
       ENV_TYPE: PreProduction
-      # Mantengo los valores "TEST" basados en los logs de error que enviaste
       SERVICE_REF: TEST
       ENV_REF: TEST
       INFRA_DEF: TEST
@@ -268,8 +267,9 @@ jobs:
                   service = spec.setdefault("service", {})
                   service["serviceRef"] = SERVICE_REF
                   
-                  # Limpiar serviceInputs si viene como <+input>
-                  if "serviceInputs" in service and service["serviceInputs"] == "<+input>":
+                  # Eliminar serviceInputs incondicionalmente, no importa su estructura,
+                  # porque delegamos la imagen a las variables del pipeline.
+                  if "serviceInputs" in service:
                       del service["serviceInputs"]
 
                   # Inyectar variables de Environment FORZADAMENTE
