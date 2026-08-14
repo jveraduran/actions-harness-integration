@@ -233,74 +233,62 @@ jobs:
           
           APP_TAG = os.environ["APP_TAG"]
           APP_REPO = os.environ["APP_REPO"]
-          REGISTRY_REF = os.environ["REGISTRY_REF"]
+          REGISTRY_REF = os.environ.get("REGISTRY_REF", "harness-demo")
           IMAGE_PATH = APP_REPO.rstrip("/").rsplit("/", 1)[-1]
           ENV_TYPE = os.environ["ENV_TYPE"]
+          SERVICE_REF = os.environ["SERVICE_REF"]
+          ENV_REF = os.environ["ENV_REF"]
+          INFRA_DEF = os.environ["INFRA_DEF"]
 
           # 1. Resolver las Pipeline Variables
           variables = pipeline.get("variables", [])
           for var in variables:
               name = var.get("name")
               val = str(var.get("value", ""))
-              if name == "app_image_repo" and "<+input>" in val:
-                  var["value"] = IMAGE_PATH
-              elif name == "app_image_tag" and "<+input>" in val:
-                  var["value"] = APP_TAG
-              elif name == "env_type" and "<+input>" in val:
-                  var["value"] = ENV_TYPE
-              elif name == "change_number" and "<+input>" in val:
-                  var["value"] = "" # Vacío por defecto
-              elif name == "run_artifact_scan" and "<+input>" in val:
-                  var["value"] = "true"
+              if "<+input>" in val:
+                  if name == "app_image_repo": var["value"] = IMAGE_PATH
+                  elif name == "app_image_tag": var["value"] = APP_TAG
+                  elif name == "env_type": var["value"] = ENV_TYPE
+                  elif name == "change_number": var["value"] = ""
+                  elif name == "run_artifact_scan": var["value"] = "true"
 
-          # 2. Resolver los Stage Inputs (deploy)
-          SERVICE_REF = os.environ["SERVICE_REF"]
-          ENV_REF = os.environ["ENV_REF"]
-          INFRA_DEF = os.environ["INFRA_DEF"]
-
-          stages = pipeline.get("stages", [])
-          for s in stages:
-              st = s.get("stage", s)
-              if st and st.get("identifier") == "deploy":
-                  spec = st.get("spec", {})
-                  
-                  # Inyectar variables de Service
-                  service = spec.setdefault("service", {})
-                  service["serviceRef"] = SERVICE_REF
-                  
-                  # AHORA SÍ: Reconstruimos serviceInputs para coincidir con tu Service TEST
-                  service["serviceInputs"] = {
-                      "serviceDefinition": {
-                          "type": "Kubernetes",
-                          "spec": {
-                              "artifacts": {
-                                  "primary": {
-                                      "primaryArtifactRef": "Harness",
-                                      "sources": [
-                                          {
-                                              "identifier": "Harness",
-                                              "type": "Har",
-                                              "spec": {
-                                                  "registryRef": REGISTRY_REF,
-                                                  "type": "docker",
-                                                  "spec": {
-                                                      "imagePath": IMAGE_PATH,
-                                                      "tag": APP_TAG,
-                                                      "digest": ""
-                                                  }
-                                              }
-                                          }
-                                      ]
+          # 2. Navegar el árbol de forma segura y reemplazar <+input> en sitio
+          # Esto evita romper el formato que Harness espera nativamente.
+          def resolve_inputs(node):
+              if isinstance(node, dict):
+                  for k, v in list(node.items()):
+                      if isinstance(v, str) and "<+input>" in v:
+                          if k == "serviceRef": 
+                              node[k] = SERVICE_REF
+                          elif k == "environmentRef": 
+                              node[k] = ENV_REF
+                          elif k == "primaryArtifactRef": 
+                              node[k] = "Harness"
+                          elif k == "sources":
+                              node[k] = [{
+                                  "identifier": "Harness",
+                                  "type": "Har",
+                                  "spec": {
+                                      "registryRef": REGISTRY_REF,
+                                      "type": "docker",
+                                      "spec": {
+                                          "imagePath": IMAGE_PATH,
+                                          "tag": APP_TAG,
+                                          "digest": ""
+                                      }
                                   }
-                              }
-                          }
-                      }
-                  }
+                              }]
+                          elif k == "infrastructureDefinitions":
+                              node[k] = [{"identifier": INFRA_DEF}]
+                          elif k == "identifier": 
+                              node[k] = INFRA_DEF
+                      else:
+                          resolve_inputs(v)
+              elif isinstance(node, list):
+                  for item in node:
+                      resolve_inputs(item)
 
-                  # Inyectar variables de Environment
-                  env = spec.setdefault("environment", {})
-                  env["environmentRef"] = ENV_REF
-                  env["infrastructureDefinitions"] = [{"identifier": INFRA_DEF}]
+          resolve_inputs(pipeline)
 
           # 3. Validar que no queden <+input> sueltos
           def find_unresolved(node, path="pipeline"):
@@ -311,7 +299,7 @@ jobs:
               elif isinstance(node, list):
                   for i, v in enumerate(node):
                       found += find_unresolved(v, f"{path}[{i}]")
-              elif isinstance(node, str) and node.strip().startswith("<+input>"):
+              elif isinstance(node, str) and "<+input>" in node:
                   found.append((path, node))
               return found
 
@@ -322,8 +310,13 @@ jobs:
                   print(f"  {path} = {value}")
               sys.exit(1)
 
+          # 4. Volcar a YAML evitando aliases (&id001) que causan el error 400 Invalid Format
+          class NoAliasDumper(yaml.SafeDumper):
+              def ignore_aliases(self, data):
+                  return True
+
           with open("runtime_input.yaml", "w") as f:
-              yaml.safe_dump({"pipeline": pipeline}, f, sort_keys=False)
+              yaml.dump({"pipeline": pipeline}, f, Dumper=NoAliasDumper, sort_keys=False)
           print("runtime_input.yaml armado correctamente.")
           PY
           
