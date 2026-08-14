@@ -35,7 +35,7 @@ on:
 
 env:
   REGISTRY: pkg.harness.io
-  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardened-nodejs-image
+  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/app1
   POLICY_ID: Docker_Base_Image
   HARNESS_PIPELINE_ID: cd_deploy_policy_gate
 
