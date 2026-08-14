@@ -1,9 +1,17 @@
 # ===========================================================================
-#  Manifiesto que consume el stage de Deployment de Harness.
+#  Manifiesto de referencia para el stage de Deployment de Harness.
 #
 #  Las expresiones <+...> las resuelve Harness en tiempo de despliegue:
-#  el artefacto viene del servicio, no está escrito aquí. Si el gate bloquea,
-#  este manifiesto nunca se aplica.
+#  el artefacto viene del servicio, no está escrito aquí.
+#
+#  OJO: las anotaciones harness.io/base-image y harness.io/gate-result de
+#  abajo apuntan a identificadores de step del pipeline OPA de
+#  pipelines/cd_deploy_policy_gate.yaml (el gate de CD que armé como diseño
+#  aparte, con schema propio). Tu pipeline real de Harness ("Build and Push -
+#  Post Hardening") tiene su stage "CD" como un K8sRollingDeploy simple, sin
+#  ese gate — así que si usas ESE pipeline, borra esas dos anotaciones o
+#  ajústalas al step real que quieras exponer; tal cual están hoy no
+#  resuelven a nada en tu pipeline actual.
 # ===========================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -44,7 +52,7 @@ spec:
         imagePullPolicy: IfNotPresent
         ports:
         - name: http
-          containerPort: 8080
+          containerPort: 3000
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

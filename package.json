@@ -1,0 +1,11 @@
+{
+  "name": "hardening-reader-1-nodejs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "App mínima para probar de punta a punta el gate de hardening (conftest + Harness).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js"
+  }
+}

@@ -1,6 +1,6 @@
 # Valores por defecto que Harness sobreescribe en tiempo de despliegue.
 # `image` lo resuelve Harness desde el artefacto del servicio.
-name: app1
+name: hardening-reader-1-nodejs
 replicas: 2
 image: <+artifact.image>
 dockerconfigjson: <+artifact.imagePullSecret>
