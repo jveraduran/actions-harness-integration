@@ -233,6 +233,7 @@ jobs:
           
           APP_TAG = os.environ["APP_TAG"]
           APP_REPO = os.environ["APP_REPO"]
+          REGISTRY_REF = os.environ["REGISTRY_REF"]
           IMAGE_PATH = APP_REPO.rstrip("/").rsplit("/", 1)[-1]
           ENV_TYPE = os.environ["ENV_TYPE"]
 
@@ -263,16 +264,40 @@ jobs:
               if st and st.get("identifier") == "deploy":
                   spec = st.get("spec", {})
                   
-                  # Inyectar variables de Service FORZADAMENTE
+                  # Inyectar variables de Service
                   service = spec.setdefault("service", {})
                   service["serviceRef"] = SERVICE_REF
                   
-                  # Eliminar serviceInputs incondicionalmente, no importa su estructura,
-                  # porque delegamos la imagen a las variables del pipeline.
-                  if "serviceInputs" in service:
-                      del service["serviceInputs"]
+                  # AHORA SÍ: Reconstruimos serviceInputs para coincidir con tu Service TEST
+                  service["serviceInputs"] = {
+                      "serviceDefinition": {
+                          "type": "Kubernetes",
+                          "spec": {
+                              "artifacts": {
+                                  "primary": {
+                                      "primaryArtifactRef": "Harness",
+                                      "sources": [
+                                          {
+                                              "identifier": "Harness",
+                                              "type": "Har",
+                                              "spec": {
+                                                  "registryRef": REGISTRY_REF,
+                                                  "type": "docker",
+                                                  "spec": {
+                                                      "imagePath": IMAGE_PATH,
+                                                      "tag": APP_TAG,
+                                                      "digest": ""
+                                                  }
+                                              }
+                                          }
+                                      ]
+                                  }
+                              }
+                          }
+                      }
+                  }
 
-                  # Inyectar variables de Environment FORZADAMENTE
+                  # Inyectar variables de Environment
                   env = spec.setdefault("environment", {})
                   env["environmentRef"] = ENV_REF
                   env["infrastructureDefinitions"] = [{"identifier": INFRA_DEF}]
