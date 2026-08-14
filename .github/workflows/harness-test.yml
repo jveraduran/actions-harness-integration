@@ -20,7 +20,7 @@ name: build-and-deploy
 
 on:
   push:
-    branches: [main, "release/**", "feature/**"]
+    branches: [master, "release/**", "feature/**"]
   workflow_dispatch:
     inputs:
       base_image_override:
