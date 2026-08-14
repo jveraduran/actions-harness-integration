@@ -106,6 +106,56 @@ jobs:
       #  account.policy-api-token (a nivel de cuenta); aquí es un secreto
       #  normal de GitHub con el mismo token.
       # -----------------------------------------------------------------
+      #  Diagnóstico del secreto ANTES de usarlo.
+      #
+      #  Nunca imprime el valor. Solo longitud, prefijo y el accountId que
+      #  viene embebido en un token de Harness (pat.<accountId>.<...>). Si
+      #  esto falla, la llamada real de abajo va a dar 401 y ya sabrás por
+      #  qué sin tener que adivinar desde el log de curl.
+      # -----------------------------------------------------------------
+      - name: Diagnóstico del secreto (sin exponerlo)
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HARNESS_API_KEY:-}" ]; then
+            echo "::error::El secreto HARNESS_API_KEY llegó VACÍO a este step."
+            echo "Causas típicas: el secreto no existe en este repo, o su nombre"
+            echo "en GitHub no es EXACTAMENTE 'HARNESS_API_KEY' (mayúsculas incluidas)."
+            echo "Revisa: Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          LEN="${#HARNESS_API_KEY}"
+          PREFIX="${HARNESS_API_KEY:0:4}"
+          echo "Longitud: ${LEN} caracteres. Empieza por: '${PREFIX}'"
+
+          case "${HARNESS_API_KEY}" in
+            pat.*|sat.*) echo "Formato OK (pat./sat.)" ;;
+            *)
+              echo "::warning::No empieza por 'pat.' ni 'sat.' — probablemente no es un token de API de Harness."
+              echo "Si al copiarlo quedaron comillas, un espacio o un salto de línea"
+              echo "al inicio/final, esto lo mostraría. Compara con lo que ves arriba."
+              ;;
+          esac
+
+          # El accountId va embebido en el token (segundo campo separado por '.').
+          # Si no coincide con ACCOUNT_ID, este token es de OTRA cuenta y el
+          # 401 es 100% esperado, sin importar si el token en sí es válido.
+          TOKEN_ACCOUNT="$(echo "${HARNESS_API_KEY}" | cut -d'.' -f2)"
+          if [ -n "${TOKEN_ACCOUNT}" ] && [ "${TOKEN_ACCOUNT}" != "${HARNESS_API_KEY}" ]; then
+            if [ "${TOKEN_ACCOUNT}" = "${ACCOUNT_ID}" ]; then
+              echo "El accountId embebido en el token coincide con ACCOUNT_ID (${ACCOUNT_ID})."
+            else
+              echo "::error::El token pertenece a la cuenta '${TOKEN_ACCOUNT}', pero ACCOUNT_ID configurado es '${ACCOUNT_ID}'."
+              echo "Este token nunca va a autenticar contra esta cuenta. Genera uno nuevo"
+              echo "para la cuenta correcta, o corrige ACCOUNT_ID si el token es el bueno."
+              exit 1
+            fi
+          fi
+
+      # -----------------------------------------------------------------
       - name: Descargar policy desde Harness
         id: policy
         env:
@@ -115,7 +165,18 @@ jobs:
           curl -sS --fail-with-body \
             -H "x-api-key: ${HARNESS_API_KEY}" \
             "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
-            -o policy_response.json
+            -o policy_response.json || {
+              CODE=$?
+              echo "::error::curl falló (código ${CODE})."
+              if [ -s policy_response.json ]; then
+                echo "Cuerpo de la respuesta:"; cat policy_response.json
+              fi
+              case "${CODE}" in
+                22) echo "HTTP 4xx/5xx — revisa el step de diagnóstico anterior: si el" \
+                         "token está vacío o es de otra cuenta, la causa es esa, no la URL." ;;
+              esac
+              exit 1
+            }
 
           jq -r '.rego' policy_response.json > image_policy.rego
 
