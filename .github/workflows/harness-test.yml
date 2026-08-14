@@ -52,11 +52,17 @@ on:
 
 env:
   REGISTRY: pkg.harness.io
-  ACCOUNT_ID: ucbjyokwry69wqkdogpexg
+  # Valor real, tal como viene embebido en tu token (sat.<accountId>.<...>).
+  # Antes tenía la versión en minúsculas que me habías pasado de palabra;
+  # el propio token reveló que el id real tiene mayúsculas mezcladas. Da
+  # igual para Docker (el paso "Normalizar el repo..." lo baja a minúsculas
+  # de todos modos), pero para las llamadas a la API de Harness conviene
+  # usar el valor exacto, por si acaso el backend es sensible a mayúsculas.
+  ACCOUNT_ID: UCBJyOkwRy69wQkDOgpexg
   HARNESS_ORG_ID: TPMDemos
   HARNESS_PROJECT_ID: devops
   REGISTRY_REF: harness-demo
-  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardening-reader-1-nodejs
+  APP_REPO: pkg.harness.io/UCBJyOkwRy69wQkDOgpexg/harness-demo/hardening-reader-1-nodejs
 
   # AJUSTA: "DEBUG" es el identificador literal que usa hoy tu pipeline de
   # Harness. Si es una policy de prueba y no la definitiva para el demo,
@@ -169,15 +175,30 @@ jobs:
           # El accountId va embebido en el token (segundo campo separado por '.').
           # Si no coincide con ACCOUNT_ID, este token es de OTRA cuenta y el
           # 401 es 100% esperado, sin importar si el token en sí es válido.
+          #
+          # OJO: la comparación es SIN distinguir mayúsculas. El accountId
+          # real de Harness puede venir con mayúsculas mezcladas (así lo trae
+          # el propio token), y no hay garantía de que quien configuró
+          # ACCOUNT_ID haya usado exactamente ese case. Comparar case-sensitive
+          # aquí dio un falso positivo real: bloqueó una ejecución por una
+          # diferencia de mayúsculas en la MISMA cuenta, no por cuentas
+          # distintas. Si de verdad son cuentas distintas, esto lo sigue
+          # detectando igual — cuentas distintas no coinciden ni ignorando case.
           TOKEN_ACCOUNT="$(echo "${HARNESS_API_KEY}" | cut -d'.' -f2)"
           if [ -n "${TOKEN_ACCOUNT}" ] && [ "${TOKEN_ACCOUNT}" != "${HARNESS_API_KEY}" ]; then
-            if [ "${TOKEN_ACCOUNT}" = "${ACCOUNT_ID}" ]; then
-              echo "El accountId embebido en el token coincide con ACCOUNT_ID (${ACCOUNT_ID})."
-            else
-              echo "::error::El token pertenece a la cuenta '${TOKEN_ACCOUNT}', pero ACCOUNT_ID configurado es '${ACCOUNT_ID}'."
+            TOKEN_ACCOUNT_LOWER="$(echo "${TOKEN_ACCOUNT}" | tr '[:upper:]' '[:lower:]')"
+            ACCOUNT_ID_LOWER="$(echo "${ACCOUNT_ID}" | tr '[:upper:]' '[:lower:]')"
+
+            if [ "${TOKEN_ACCOUNT_LOWER}" != "${ACCOUNT_ID_LOWER}" ]; then
+              echo "::error::El token pertenece a la cuenta '${TOKEN_ACCOUNT}', pero ACCOUNT_ID configurado es '${ACCOUNT_ID}'. Son cuentas distintas incluso ignorando mayúsculas."
               echo "Este token nunca va a autenticar contra esta cuenta. Genera uno nuevo"
               echo "para la cuenta correcta, o corrige ACCOUNT_ID si el token es el bueno."
               exit 1
+            elif [ "${TOKEN_ACCOUNT}" != "${ACCOUNT_ID}" ]; then
+              echo "::warning::El accountId coincide, pero con mayúsculas distintas: token='${TOKEN_ACCOUNT}' vs ACCOUNT_ID='${ACCOUNT_ID}'."
+              echo "No bloquea (para Harness API probablemente da igual), pero conviene alinear ACCOUNT_ID al valor exacto del token."
+            else
+              echo "El accountId embebido en el token coincide con ACCOUNT_ID (${ACCOUNT_ID})."
             fi
           fi
 
