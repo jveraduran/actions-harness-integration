@@ -176,15 +176,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     env:
-      # 1. El nuevo identificador de tu pipeline
       HARNESS_PIPELINE_ID: cd_deploy_policy_gate
       APP_TAG: ${{ needs.build.outputs.app_tag }}
       APP_REPO: ${{ needs.build.outputs.app_repo }}
       
-      # 2. NUEVOS REQUISITOS: Como tu pipeline tiene el Service y el Environment 
-      # configurados como <+input>, debes decirle a la API cuáles usar.
-      # REEMPLAZA estos valores con los IDENTIFICADORES reales de Harness.
       ENV_TYPE: PreProduction
+      # Mantengo los valores "TEST" basados en los logs de error que enviaste
       SERVICE_REF: TEST
       ENV_REF: TEST
       INFRA_DEF: TEST
@@ -267,20 +264,18 @@ jobs:
               if st and st.get("identifier") == "deploy":
                   spec = st.get("spec", {})
                   
-                  # Inyectar variables de Service
-                  service = spec.get("service", {})
-                  if service.get("serviceRef") == "<+input>":
-                      service["serviceRef"] = SERVICE_REF
-                  # Como pasamos la imagen por pipeline variable, eliminamos la necesidad de inyectar serviceInputs
-                  if service.get("serviceInputs") == "<+input>":
+                  # Inyectar variables de Service FORZADAMENTE
+                  service = spec.setdefault("service", {})
+                  service["serviceRef"] = SERVICE_REF
+                  
+                  # Limpiar serviceInputs si viene como <+input>
+                  if "serviceInputs" in service and service["serviceInputs"] == "<+input>":
                       del service["serviceInputs"]
 
-                  # Inyectar variables de Environment
-                  env = spec.get("environment", {})
-                  if env.get("environmentRef") == "<+input>":
-                      env["environmentRef"] = ENV_REF
-                  if env.get("infrastructureDefinitions") == "<+input>":
-                      env["infrastructureDefinitions"] = [{"identifier": INFRA_DEF}]
+                  # Inyectar variables de Environment FORZADAMENTE
+                  env = spec.setdefault("environment", {})
+                  env["environmentRef"] = ENV_REF
+                  env["infrastructureDefinitions"] = [{"identifier": INFRA_DEF}]
 
           # 3. Validar que no queden <+input> sueltos
           def find_unresolved(node, path="pipeline"):
