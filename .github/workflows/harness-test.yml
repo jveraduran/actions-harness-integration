@@ -34,9 +34,9 @@ on:
         default: false
 
 env:
-  REGISTRY: harness-registry.example.io
-  APP_REPO: harness-registry.example.io/apps/app1
-  POLICY_ID: hardened_image_cd
+  REGISTRY: pkg.harness.io
+  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardened-nodejs-image
+  POLICY_ID: Docker_Base_Image
   HARNESS_PIPELINE_ID: cd_deploy_policy_gate
 
 jobs:
