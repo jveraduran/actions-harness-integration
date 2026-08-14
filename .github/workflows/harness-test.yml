@@ -1,107 +1,169 @@
 # ===========================================================================
-#  app1 - build, push y disparo del CD en Harness
+#  hardening-reader-1-nodejs — build con gate de policy vía conftest
 #
-#  Sustituye al snippet suelto que estaba en ci/. Este sí es un workflow
-#  completo y ejecutable sobre este repo.
+#  Este workflow es el port EXACTO del pipeline de Harness CI que ya te
+#  funciona hoy ("Build and Push - Post Hardening"), traducido a GitHub
+#  Actions. No es mi diseño anterior (crane + Trivy + un schema de OPA
+#  inventado) — ese lo descarto aquí porque no es lo que está probado.
 #
-#  Dos formas de arrancarlo:
+#  Mapeo de stages de Harness -> steps de este workflow:
 #
-#   1. push  -> build normal. La base image se resuelve desde la policy de
-#               Harness, así que el artefacto SIEMPRE sale conforme.
+#    Harness "Download Policy" (stage Custom, step Http)
+#      -> step "Descargar policy desde Harness" de este job
 #
-#   2. workflow_dispatch -> permite FORZAR una base image retirada.
-#               Esto es lo que necesitas para producir el artefacto que el
-#               gate debe bloquear en el demo. Sin este input no hay forma de
-#               generar un artefacto no conforme, porque el camino normal
-#               ya no deja escoger la base.
+#    Harness "Build and Push" (stage CI)
+#      GitClone                      -> actions/checkout (ya estás en el repo)
+#      Run "Check Policy" (conftest) -> steps "Renderizar Dockerfile" + "Evaluar con conftest"
+#      BuildAndPushDockerRegistry    -> docker/build-push-action
+#
+#    Harness "CD" (stage Deployment, K8sRollingDeploy)
+#      -> NO está en este workflow. Ese stage de tu pipeline hoy no tiene
+#         ningún gate de policy, solo despliega. Si migras únicamente el
+#         tramo de CI a GitHub Actions y dejas el CD donde está en Harness,
+#         no hace falta que este workflow dispare nada más.
+#
+#  Valores reales confirmados por el pipeline de Harness que pegaste:
+#    registry     : pkg.harness.io
+#    cuenta       : ucbjyokwry69wqkdogpexg
+#    org          : TPMDemos
+#    proyecto     : devops
+#    registry ref : harness-demo
+#    repo/imagen  : hardening-reader-1-nodejs
+#    base image   : pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardened-nodejs-image
+#    endpoint     : https://app.harness.io/gateway/pm/api/v1/policies/{id}   <- confirmado, con /gateway
 # ===========================================================================
 
 name: build-and-deploy
 
 on:
+  # En el pipeline de Harness, el trigger es el push de un TAG en este mismo
+  # repo, y el nombre del tag (sin 'refs/tags/') es lo que se inyecta como
+  # BASE_TAG. Mismo modelo aquí: tageas el repo con la versión de base image
+  # que quieres usar, y el push del tag dispara el build.
   push:
-    branches: [master, "release/**", "feature/**"]
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
-      base_image_override:
-        description: "Forzar una base image (ej. .../base-java:1.0.39) para provocar el bloqueo del gate. Vacío = usar la vigente de la policy."
+      base_tag:
+        description: "Tag de la base image a inyectar (ej. v1.0.42). Vacío = usar el del git tag que disparó el workflow."
         required: false
         default: ""
-      skip_deploy:
-        description: "Solo construir y publicar, sin disparar el CD"
-        type: boolean
-        required: false
-        default: false
 
 env:
   REGISTRY: pkg.harness.io
-  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/app1
-  POLICY_ID: Docker_Base_Image
-  HARNESS_PIPELINE_ID: cd_deploy_policy_gate
+  ACCOUNT_ID: ucbjyokwry69wqkdogpexg
+  HARNESS_ORG_ID: TPMDemos
+  HARNESS_PROJECT_ID: devops
+  REGISTRY_REF: harness-demo
+  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardening-reader-1-nodejs
+
+  # AJUSTA: "DEBUG" es el identificador literal que usa hoy tu pipeline de
+  # Harness. Si es una policy de prueba y no la definitiva para el demo,
+  # cámbialo aquí antes del viernes.
+  POLICY_ID: DEBUG
 
 jobs:
-  # =======================================================================
   build:
     runs-on: ubuntu-latest
     outputs:
-      app_tag: ${{ steps.meta.outputs.app_tag }}
-      base_ref: ${{ steps.base.outputs.base_ref }}
-      compliant: ${{ steps.base.outputs.compliant }}
+      app_tag: ${{ steps.tag.outputs.app_tag }}
+      base_tag: ${{ steps.base.outputs.base_tag }}
     steps:
       - uses: actions/checkout@v4
 
       # -----------------------------------------------------------------
-      #  La base image sale de la policy, no del Dockerfile.
-      #  Una sola fuente de verdad, compartida con el gate de CD.
+      #  Equivalente a tu <+trigger.payload.ref.name.replace("refs/tags/","")>.
+      #  github.ref_name en un push de tag YA viene sin el prefijo 'refs/tags/',
+      #  así que aquí no hace falta el .replace().
       # -----------------------------------------------------------------
-      - name: Resolver base image hardened
+      - name: Resolver BASE_TAG
         id: base
-        env:
-          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
-          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
-          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
-          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
-          OVERRIDE: ${{ github.event.inputs.base_image_override }}
         run: |
           set -euo pipefail
-
-          # AJUSTA la ruta al endpoint que ya usas en el gate de CI.
-          curl -sS --fail-with-body \
-            -H "x-api-key: ${HARNESS_API_KEY}" \
-            "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
-            -o policy.json
-
-          jq -r '.rego' policy.json > policy.rego
-
-          STABLE_REPO=$(grep -A4 '^stable_base' policy.rego | grep '"repo"'   | cut -d'"' -f4)
-          STABLE_TAG=$(grep  -A4 '^stable_base' policy.rego | grep '"tag"'    | cut -d'"' -f4)
-          STABLE_DIGEST=$(grep -A4 '^stable_base' policy.rego | grep '"digest"' | cut -d'"' -f4)
-
-          echo "Base image hardened vigente segun la policy: ${STABLE_REPO}:${STABLE_TAG}"
-
-          if [ -n "${OVERRIDE:-}" ]; then
-            echo "::warning::Override manual activo. Construyendo sobre '${OVERRIDE}' en lugar de la base vigente. Este artefacto DEBE ser rechazado por el gate de CD."
-            echo "base_ref=${OVERRIDE}"  >> "$GITHUB_OUTPUT"
-            echo "base_digest="          >> "$GITHUB_OUTPUT"
-            echo "compliant=false"       >> "$GITHUB_OUTPUT"
+          if [ -n "${{ github.event.inputs.base_tag }}" ]; then
+            BASE_TAG="${{ github.event.inputs.base_tag }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            BASE_TAG="${{ github.ref_name }}"
           else
-            echo "base_ref=${STABLE_REPO}:${STABLE_TAG}" >> "$GITHUB_OUTPUT"
-            echo "base_digest=${STABLE_DIGEST}"          >> "$GITHUB_OUTPUT"
-            echo "compliant=true"                        >> "$GITHUB_OUTPUT"
+            echo "::error::Este workflow espera un push de tag (v*) o un base_tag manual vía workflow_dispatch."
+            exit 1
           fi
+          echo "BASE_TAG resuelto: ${BASE_TAG}"
+          echo "base_tag=${BASE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Calcular tag del artefacto
-        id: meta
+        id: tag
+        run: |
+          # Mismo esquema que <+pipeline.sequenceId> de Harness: un contador
+          # que crece con cada ejecución. github.run_number es el equivalente.
+          echo "app_tag=v.1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      #  Idéntico al step Http "Check Policy" del stage Download_Policy.
+      #  Mismo endpoint (con /gateway), mismo scope de query params, mismo
+      #  campo de salida (.rego). El secreto de Harness es
+      #  account.policy-api-token (a nivel de cuenta); aquí es un secreto
+      #  normal de GitHub con el mismo token.
+      # -----------------------------------------------------------------
+      - name: Descargar policy desde Harness
+        id: policy
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
         run: |
           set -euo pipefail
-          SUFFIX=""
-          if [ "${{ steps.base.outputs.compliant }}" = "false" ]; then
-            # Tag distinguible para no confundir artefactos durante el demo.
-            SUFFIX="-stalebase"
-          fi
-          echo "app_tag=v$(date +%Y%m%d%H%M)-${GITHUB_SHA::7}${SUFFIX}" >> "$GITHUB_OUTPUT"
+          curl -sS --fail-with-body \
+            -H "x-api-key: ${HARNESS_API_KEY}" \
+            "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
+            -o policy_response.json
 
-      - uses: docker/setup-buildx-action@v3
+          jq -r '.rego' policy_response.json > image_policy.rego
+
+          if [ ! -s image_policy.rego ] || [ "$(cat image_policy.rego)" = "null" ]; then
+            echo "::error::La respuesta no trajo un campo .rego usable. Contenido recibido:"
+            cat policy_response.json
+            exit 1
+          fi
+
+          echo "Policy '${POLICY_ID}' descargada: $(wc -c < image_policy.rego | tr -d ' ') caracteres de Rego"
+
+      # -----------------------------------------------------------------
+      #  Idéntico al bloque "Rendering the Dockerfile" del step Run/conftest.
+      #
+      #  OJO — esto es lo que te señalo aparte en el mensaje: este sed
+      #  reemplaza un placeholder LITERAL '${BASE_TAG}' en el texto del
+      #  Dockerfile. Si tu FROM real usa 'FROM imagen:${BASE_TAG}' (sustitución
+      #  nativa de Docker vía ARG), este sed sí tiene algo que reemplazar y
+      #  produce un Dockerfile ya resuelto para que conftest lo evalúe de
+      #  forma estática. Si en cambio tu FROM tiene una versión fija tecleada
+      #  a mano (ej. ':v1.0.41'), este sed no encuentra nada que sustituir y
+      #  rendered.Dockerfile sale idéntico al original: el BASE_TAG del
+      #  trigger deja de tener efecto sobre qué se construye.
+      # -----------------------------------------------------------------
+      - name: Renderizar Dockerfile con BASE_TAG
+        env:
+          BASE_TAG_VALUE: ${{ steps.base.outputs.base_tag }}
+        run: |
+          set -euo pipefail
+          echo "Tag a inyectar: ${BASE_TAG_VALUE}"
+          sed "s|\${BASE_TAG}|${BASE_TAG_VALUE}|g" Dockerfile > rendered.Dockerfile
+          echo "--- FROM resultante ---"
+          grep -i '^FROM' rendered.Dockerfile || echo "(sin línea FROM — revisa el Dockerfile)"
+
+      # -----------------------------------------------------------------
+      #  Idéntico al "conftest test rendered.Dockerfile -p image_policy.rego"
+      #  que corre dentro del step Run de Harness (imagen instrumenta/conftest).
+      #  Aquí se invoca el mismo contenedor vía docker run, ya que GitHub
+      #  Actions no tiene un equivalente directo a "este Run step corre
+      #  dentro de esta imagen" a nivel de step individual.
+      # -----------------------------------------------------------------
+      - name: Evaluar con conftest
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${PWD}:/project" -w /project \
+            instrumenta/conftest:latest \
+            test rendered.Dockerfile -p image_policy.rego
 
       - uses: docker/login-action@v3
         with:
@@ -110,9 +172,13 @@ jobs:
           password: ${{ secrets.REGISTRY_TOKEN }}
 
       # -----------------------------------------------------------------
-      #  Los labels OCI de base image son el contrato con el gate de CD.
-      #  Se pasan por build-arg (el Dockerfile los declara con LABEL) y
-      #  también aquí, para que el valor gane sobre cualquier build local.
+      #  Idéntico al step BuildAndPushDockerRegistry.
+      #
+      #  Ojo: el build usa el Dockerfile ORIGINAL (con el ARG BASE_TAG),
+      #  no rendered.Dockerfile. rendered.Dockerfile existe solo para que
+      #  conftest pueda analizar un FROM ya resuelto; el build real deja que
+      #  Docker resuelva ${BASE_TAG} de forma nativa vía --build-arg, igual
+      #  que hace el step de Harness con buildArgs.BASE_TAG.
       # -----------------------------------------------------------------
       - name: Build y push
         uses: docker/build-push-action@v6
@@ -120,43 +186,9 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          provenance: false
           build-args: |
-            BASE_IMAGE=${{ steps.base.outputs.base_ref }}
-            BASE_DIGEST=${{ steps.base.outputs.base_digest }}
-            APP_VERSION=${{ steps.meta.outputs.app_tag }}
-            GIT_SHA=${{ github.sha }}
-          tags: ${{ env.APP_REPO }}:${{ steps.meta.outputs.app_tag }}
-          labels: |
-            org.opencontainers.image.base.name=${{ steps.base.outputs.base_ref }}
-            org.opencontainers.image.base.digest=${{ steps.base.outputs.base_digest }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # -----------------------------------------------------------------
-      #  Verificación local del contrato: si el label no quedó escrito, el
-      #  gate fallaría por [A1] y sería difícil de diagnosticar en vivo.
-      #  Mejor descubrirlo aquí que en medio del demo.
-      # -----------------------------------------------------------------
-      - name: Verificar labels del artefacto publicado
-        run: |
-          set -euo pipefail
-          REF="${APP_REPO}:${{ steps.meta.outputs.app_tag }}"
-
-          docker buildx imagetools inspect "${REF}" --format '{{json .Image}}' \
-            > inspect.json || {
-              echo "::error::No se pudo inspeccionar ${REF}"; exit 1; }
-
-          BASE_LABEL=$(jq -r '.. | .Labels? // empty | ."org.opencontainers.image.base.name" // empty' inspect.json | head -1)
-
-          if [ -z "${BASE_LABEL}" ]; then
-            echo "::error::El artefacto no tiene el label org.opencontainers.image.base.name. El gate de CD lo rechazaria por la regla [A1]."
-            exit 1
-          fi
-
-          echo "Label de base image verificado: ${BASE_LABEL}"
+            BASE_TAG=${{ steps.base.outputs.base_tag }}
+          tags: ${{ env.APP_REPO }}:${{ steps.tag.outputs.app_tag }}
 
       - name: Resumen
         run: |
@@ -165,94 +197,19 @@ jobs:
             echo ""
             echo "| Campo | Valor |"
             echo "|---|---|"
-            echo "| Imagen | \`${APP_REPO}:${{ steps.meta.outputs.app_tag }}\` |"
-            echo "| Base image | \`${{ steps.base.outputs.base_ref }}\` |"
-            echo "| Conforme con la policy | ${{ steps.base.outputs.compliant }} |"
+            echo "| Imagen | \`${APP_REPO}:${{ steps.tag.outputs.app_tag }}\` |"
+            echo "| BASE_TAG inyectado | \`${{ steps.base.outputs.base_tag }}\` |"
+            echo "| Policy evaluada | \`${POLICY_ID}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # =======================================================================
-  #  Disparo del CD. El tag viaja en el body: nadie lo teclea en la consola.
-  # =======================================================================
-  deploy:
-    needs: build
-    if: ${{ github.event.inputs.skip_deploy != 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Disparar pipeline de CD en Harness
-        id: trigger
-        env:
-          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
-          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
-          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
-          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
-          APP_TAG: ${{ needs.build.outputs.app_tag }}
-        run: |
-          set -euo pipefail
-
-          cat > runtime-inputs.yaml <<EOF
-          pipeline:
-            identifier: ${HARNESS_PIPELINE_ID}
-            variables:
-              - name: app_image_repo
-                type: String
-                value: ${APP_REPO}
-              - name: app_image_tag
-                type: String
-                value: ${APP_TAG}
-              - name: env_type
-                type: String
-                value: PreProduction
-              - name: change_number
-                type: String
-                value: ""
-              - name: run_artifact_scan
-                type: String
-                value: "true"
-          EOF
-
-          RESP=$(curl -sS --fail-with-body -X POST \
-            -H "x-api-key: ${HARNESS_API_KEY}" \
-            -H "Content-Type: application/yaml" \
-            "https://app.harness.io/pipeline/api/pipeline/execute/${HARNESS_PIPELINE_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
-            --data-binary @runtime-inputs.yaml)
-
-          EXEC_ID=$(echo "$RESP" | jq -r '.data.planExecution.uuid')
-          echo "exec_id=${EXEC_ID}" >> "$GITHUB_OUTPUT"
-          echo "Ejecución de Harness: ${EXEC_ID}"
-
-      # -----------------------------------------------------------------
-      #  El control vuelve a GitHub Actions con el resultado real.
-      #  Esto es lo que pedía Anil (min 39:38): no entrar a la consola de
-      #  Harness para saber si el despliegue pasó o falló.
-      # -----------------------------------------------------------------
-      - name: Esperar resultado del despliegue
-        env:
-          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
-          HARNESS_ACCOUNT: ${{ secrets.HARNESS_ACCOUNT_ID }}
-          HARNESS_ORG: ${{ secrets.HARNESS_ORG_ID }}
-          HARNESS_PROJECT: ${{ secrets.HARNESS_PROJECT_ID }}
-          EXEC_ID: ${{ steps.trigger.outputs.exec_id }}
-        run: |
-          set -euo pipefail
-
-          for i in $(seq 1 120); do
-            STATUS=$(curl -sS \
-              -H "x-api-key: ${HARNESS_API_KEY}" \
-              "https://app.harness.io/pipeline/api/pipelines/execution/v2/${EXEC_ID}?accountIdentifier=${HARNESS_ACCOUNT}&orgIdentifier=${HARNESS_ORG}&projectIdentifier=${HARNESS_PROJECT}" \
-              | jq -r '.data.pipelineExecutionSummary.status')
-
-            echo "[$i] Estado: ${STATUS}"
-
-            case "${STATUS}" in
-              Success)
-                echo "Despliegue completado."
-                exit 0 ;;
-              Failed|Aborted|Errored|Expired|ApprovalRejected)
-                echo "::error::El despliegue terminó en ${STATUS}. Si fue el gate, revisa el paso 'Evaluar policy' en Harness."
-                exit 1 ;;
-            esac
-            sleep 15
-          done
-
-          echo "::error::Timeout esperando el despliegue."
-          exit 1
+  # =========================================================================
+  #  No incluido: el disparo del stage "CD" de Harness.
+  #
+  #  Tu pipeline de Harness ya hace CD dentro de la misma ejecución (stage
+  #  Deployment con K8sRollingDeploy), así que no hace falta que GitHub
+  #  Actions dispare nada por separado si el resto del pipeline se deja
+  #  intacto y solo migras el tramo de CI. Si en algún momento quieres que
+  #  TODO el flujo (CI + CD) viva en GitHub Actions y llame a Harness solo
+  #  para el despliegue, dilo y agrego el job de trigger + polling que tenía
+  #  la versión anterior de este workflow.
+  # =========================================================================
