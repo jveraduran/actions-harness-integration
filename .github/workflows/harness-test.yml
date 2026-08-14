@@ -41,8 +41,7 @@ on:
   # BASE_TAG. Mismo modelo aquí: tageas el repo con la versión de base image
   # que quieres usar, y el push del tag dispara el build.
   push:
-    tags:
-      - "v*"
+    branches: [master, "release/**", "feature/**"]
   workflow_dispatch:
     inputs:
       base_tag:
