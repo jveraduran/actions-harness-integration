@@ -52,11 +52,11 @@ on:
 
 env:
   REGISTRY: pkg.harness.io
-  ACCOUNT_ID: UCBJyOkwRy69wQkDOgpexg
+  ACCOUNT_ID: ucbjyokwry69wqkdogpexg
   HARNESS_ORG_ID: TPMDemos
   HARNESS_PROJECT_ID: devops
   REGISTRY_REF: harness-demo
-  APP_REPO: pkg.harness.io/UCBJyOkwRy69wQkDOgpexg/harness-demo/hardening-reader-1-nodejs
+  APP_REPO: pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardening-reader-1-nodejs
 
   # AJUSTA: "DEBUG" es el identificador literal que usa hoy tu pipeline de
   # Harness. Si es una policy de prueba y no la definitiva para el demo,
@@ -98,6 +98,32 @@ jobs:
           # Mismo esquema que <+pipeline.sequenceId> de Harness: un contador
           # que crece con cada ejecución. github.run_number es el equivalente.
           echo "app_tag=v.1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      #  Docker/OCI exige que el REPOSITORIO de un tag sea 100% minúsculas
+      #  (no es negociable — es la spec de distribution: cada segmento del
+      #  path solo admite [a-z0-9._-]). El tag en sí, después de los dos
+      #  puntos, sí puede tener mayúsculas; solo el repo no.
+      #
+      #  El pipeline nativo de Harness nunca choca con esto porque su step
+      #  BuildAndPushDockerRegistry no construye la URL a mano: recibe un
+      #  'repo' corto y un 'registryRef' abstracto, y Harness resuelve la URL
+      #  real del lado del servidor. Aquí SÍ se construye el string del tag
+      #  directamente para pasárselo a buildx, así que la regla aplica en
+      #  crudo. Se normaliza acá, una sola vez, para que no importe con qué
+      #  mayúsculas/minúsculas venga ACCOUNT_ID (el que se ve en la URL de
+      #  Harness, por ejemplo, no necesariamente coincide en case con el que
+      #  hace falta para el path de Docker).
+      # -----------------------------------------------------------------
+      - name: Normalizar el repo de la imagen a minúsculas
+        id: repo
+        run: |
+          set -euo pipefail
+          LOWER="$(echo "${APP_REPO}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${LOWER}" != "${APP_REPO}" ]; then
+            echo "::warning::APP_REPO tenía mayúsculas ('${APP_REPO}'). Docker las rechaza en el repo (no en el tag). Usando '${LOWER}'."
+          fi
+          echo "app_repo=${LOWER}" >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------
       #  Idéntico al step Http "Check Policy" del stage Download_Policy.
@@ -249,16 +275,18 @@ jobs:
           push: true
           build-args: |
             BASE_TAG=${{ steps.base.outputs.base_tag }}
-          tags: ${{ env.APP_REPO }}:${{ steps.tag.outputs.app_tag }}
+          tags: ${{ steps.repo.outputs.app_repo }}:${{ steps.tag.outputs.app_tag }}
 
       - name: Resumen
+        env:
+          APP_REPO_LOWER: ${{ steps.repo.outputs.app_repo }}
         run: |
           {
             echo "### Artefacto publicado"
             echo ""
             echo "| Campo | Valor |"
             echo "|---|---|"
-            echo "| Imagen | \`${APP_REPO}:${{ steps.tag.outputs.app_tag }}\` |"
+            echo "| Imagen | \`${APP_REPO_LOWER}:${{ steps.tag.outputs.app_tag }}\` |"
             echo "| BASE_TAG inyectado | \`${{ steps.base.outputs.base_tag }}\` |"
             echo "| Policy evaluada | \`${POLICY_ID}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
