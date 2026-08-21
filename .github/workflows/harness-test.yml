@@ -724,17 +724,41 @@ jobs:
           set -euo pipefail
           PREFIX="${{ steps.template.outputs.prefix }}"
 
-          BODY_FILE="$(mktemp)"
-          jq -n \
-            --rawfile yaml runtime_input.yaml \
-            '{runtimeInputYaml: $yaml}' \
-            > "${BODY_FILE}"
-
+          # ---------------------------------------------------------------
+          #  ESTE ENDPOINT ESPERA YAML CRUDO, NO JSON.
+          #
+          #  Aquí estaba el bug que hacía que la ejecución arrancara con
+          #  TODOS los inputs vacíos (comparado con una ejecución manual,
+          #  donde sí salían Primary Artifact / Registry / Image / Tag).
+          #  Antes se mandaba:
+          #
+          #    -H "Content-Type: application/json"
+          #    -d '{"runtimeInputYaml": "pipeline:\n  identifier: ..."}'
+          #
+          #  Harness devuelve 200 y crea la ejecución, pero NO parsea ningún
+          #  input: espera el YAML directamente en el cuerpo. Resultado: un
+          #  deploy sin artefacto, y el service step muriendo después de
+          #  "Adding manifest from service".
+          #
+          #  Contrato correcto, confirmado en la doc del endpoint
+          #  ("Execute a Pipeline with Runtime Input YAML",
+          #  https://apidocs.harness.io/pipeline-execute/postpipelineexecutewithinputsetyaml):
+          #    Content-Type: application/yaml
+          #    body: el runtime input YAML tal cual
+          #
+          #  OJO con --data-binary: 'curl -d @archivo' ELIMINA los saltos de
+          #  línea, lo que destruiría el YAML. --data-binary lo manda byte a
+          #  byte. No cambiar esto por -d.
+          #
+          #  (El endpoint /stages, que usábamos antes, sí llevaba JSON con
+          #  el campo runtimeInputYaml. Son contratos distintos — eso fue lo
+          #  que despistó.)
+          # ---------------------------------------------------------------
           curl -sS --fail-with-body -o exec_response.json -X POST \
             -H "x-api-key: ${HARNESS_API_KEY}" \
-            -H "Content-Type: application/json" \
+            -H "Content-Type: application/yaml" \
             "https://app.harness.io${PREFIX}/pipeline/api/pipeline/execute/${HARNESS_PIPELINE_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&moduleType=CD" \
-            -d @"${BODY_FILE}" || {
+            --data-binary @runtime_input.yaml || {
               echo "::error::curl falló disparando el pipeline. Respuesta:"
               cat exec_response.json 2>/dev/null || true
               exit 1
@@ -751,10 +775,65 @@ jobs:
           echo "Ejecución del pipeline disparada: ${EXEC_ID}"
 
       # -----------------------------------------------------------------
+      #  Verificar que los inputs SÍ se aplicaron.
+      #
+      #  Este step existe por lo que paso antes: Harness devolvia 200, la
+      #  ejecucion arrancaba, y este workflow la reportaba como disparada
+      #  correctamente — pero en la pestaña "Inputs" de Harness los cuatro
+      #  campos del artefacto salian vacios ("Select Artifact Source",
+      #  "- Select Registry -"), mientras que en una ejecucion manual salian
+      #  llenos. Un 200 NO garantiza que los inputs llegaran.
+      #
+      #  Aqui se pide la ejecucion recien creada y se comprueba que el tag
+      #  aparece en ella. Si no aparece, se falla de inmediato en vez de
+      #  esperar 30 minutos a que el deploy muera por falta de artefacto.
+      # -----------------------------------------------------------------
+      - name: Verificar que los inputs llegaron a Harness
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.template.outputs.prefix }}"
+          EXEC_ID="${{ steps.trigger.outputs.exec_id }}"
+
+          # Un momento de gracia: la ejecucion acaba de crearse.
+          sleep 10
+
+          curl -sS -o detail.json \
+            -H "x-api-key: ${HARNESS_API_KEY}" \
+            "https://app.harness.io${PREFIX}/pipeline/api/pipelines/execution/v2/${EXEC_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" || true
+
+          if ! [ -s detail.json ]; then
+            echo "::warning::No pude leer el detalle de la ejecución para verificar los inputs. Sigo adelante; el step de espera dirá si funcionó."
+            exit 0
+          fi
+
+          # Busqueda cruda a proposito: no depende de adivinar en que campo
+          # del JSON guarda Harness el input resuelto. Si el tag no esta en
+          # NINGUNA parte del detalle de la ejecucion, los inputs no llegaron.
+          if grep -Fq "${APP_TAG}" detail.json; then
+            echo "OK: el tag '${APP_TAG}' aparece en la ejecución — los inputs se aplicaron."
+          else
+            echo "::error::========================================================"
+            echo "::error::La ejecución arrancó pero el tag '${APP_TAG}' NO aparece"
+            echo "::error::en su detalle. Los runtime inputs no se aplicaron."
+            echo "::error::"
+            echo "::error::Revisa en Harness la pestaña 'Inputs' de la ejecución"
+            echo "::error::${EXEC_ID}: si los campos del artefacto salen vacíos"
+            echo "::error::('Select Artifact Source', '- Select Registry -'),"
+            echo "::error::el cuerpo del request no se parseó."
+            echo "::error::"
+            echo "::error::Causa típica: este endpoint exige"
+            echo "::error::  Content-Type: application/yaml"
+            echo "::error::con el YAML crudo en el cuerpo (--data-binary),"
+            echo "::error::NO un JSON con el campo runtimeInputYaml."
+            echo "::error::========================================================"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------
       #  El control vuelve a GitHub Actions con el resultado real — no hace
       #  falta entrar a la consola de Harness para saber si terminó bien.
-      #  Es el status del PIPELINE completo (Download_Policy + Build_and_Push
-      #  + CD), ya no solo del stage CD, porque ahora se ejecuta todo junto.
       # -----------------------------------------------------------------
       - name: Esperar resultado de la ejecución
         env:
