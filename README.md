@@ -1,7 +1,5 @@
 # Policy-gated CD — hardening enforcement before deployment
 
-Answer to what Barath and Ramesh asked on the call (min 15:32 – 18:34):
-
 > *"Is there a way we can implement the same policy on the CD part?"*
 > *"…if there is a registry of vulnerable images, the application image, not even the base image… if the image is vulnerable, then we should not allow the deployment."*
 > *"Both combination will be best. One is the application container image itself… another approach will be based on the base image level."*
