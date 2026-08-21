@@ -393,6 +393,202 @@ jobs:
       ENV_REF: TEST
       INFRA_DEF: TEST                # admite varios separados por coma
     steps:
+      # =================================================================
+      #  GATE DE IMAGEN AUTORIZADA — parte que corre en GitHub Actions
+      #
+      #  Objetivo: que nunca se despliegue una imagen distinta a la que
+      #  este build acaba de compilar y validar contra la policy de
+      #  hardening.
+      #
+      #  Este step FIJA esa imagen en la policy CD_Docker_Check de Harness
+      #  Policy Management. El pipeline de CD la baja y la evalúa con
+      #  conftest antes de desplegar (stages nuevos
+      #  'Descargar_Policy_CD' + 'Verificar_Imagen_Autorizada').
+      #
+      #  Endpoint confirmado en https://apidocs.harness.io/tag/policies:
+      #    PATCH /pm/api/v1/policies/{identifier}
+      #    body JSON: {"name": "...", "rego": "..."}
+      #
+      #  OJO — este endpoint SÍ es JSON, a diferencia del de ejecutar
+      #  pipeline (que exige YAML crudo). Son contratos distintos dentro
+      #  de la misma API; no unificarlos.
+      #
+      #  SCOPE: tu URL de la policy no tiene /orgs/ ni /projects/, así que
+      #  CD_Docker_Check está a nivel de CUENTA -> solo accountIdentifier.
+      #  Se intenta primero así y, si da 404, se reintenta con org+project
+      #  por si en realidad está más abajo.
+      #
+      #  PERMISOS: este token ya no solo lee policies, las MODIFICA. Si el
+      #  PATCH devuelve 403, al token le falta permiso de edición sobre
+      #  Governance/Policies (leer no alcanza).
+      # =================================================================
+      - name: Fijar la imagen autorizada en la policy de Harness
+        id: pin_policy
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          POLICY_CD_ID: CD_Docker_Check
+        run: |
+          set -euo pipefail
+          FULL_IMAGE="${APP_REPO}:${APP_TAG}"
+          echo "Imagen a autorizar: ${FULL_IMAGE}"
+          echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+
+          # -------------------------------------------------------------
+          #  El rego va aquí, inline, a propósito: el Action es el dueño
+          #  del contenido de esta policy. Si estuviera en el repo haría
+          #  falta un checkout en este job y habría dos fuentes de verdad.
+          #
+          #  Sintaxis Rego v0 ('deny[msg] { }') porque es la que entiende
+          #  instrumenta/conftest:latest, el contenedor que ya usan tus
+          #  pipelines. Con openpolicyagent/conftest (OPA 1.x) habría que
+          #  escribirlo como 'deny contains msg if { }'.
+          #
+          #  Validado con opa 0.68 en 5 escenarios: imagen correcta (0
+          #  denies), tag distinto, repo distinto, campo ausente y campo
+          #  vacío (1 deny cada uno).
+          # -------------------------------------------------------------
+          cat > cd_docker_check.rego << 'REGO'
+          package main
+
+          # =====================================================================
+          #  CD_Docker_Check - unica imagen autorizada para desplegar
+          #
+          #  GENERADO AUTOMATICAMENTE por el workflow build-and-deploy de GitHub
+          #  Actions. NO editar a mano en la UI de Harness: el proximo build lo
+          #  sobreescribe via PATCH.
+          #
+          #  Build:  __BUILD_URL__
+          #  Commit: __COMMIT_SHA__
+          # =====================================================================
+
+          # La unica imagen que se permite desplegar. La fija el build que acaba
+          # de pasar el gate de hardening (conftest sobre el Dockerfile).
+          allowed_image := "__ALLOWED_IMAGE__"
+
+          # --- Regla 1: la imagen debe ser EXACTAMENTE la autorizada -----------
+          deny[msg] {
+              input.image != allowed_image
+              msg := sprintf("Imagen no autorizada: '%v'. La unica permitida es '%v', fijada por el build que paso el gate de hardening.", [input.image, allowed_image])
+          }
+
+          # --- Regla 2: fallo cerrado si no se puede identificar la imagen -----
+          deny[msg] {
+              not input.image
+              msg := "El input no declara el campo 'image'. Sin poder identificar que se despliega, se bloquea por defecto."
+          }
+          REGO
+
+          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # '|' como separador de sed: la imagen y la URL llevan '/'.
+          sed -i \
+            -e "s|__ALLOWED_IMAGE__|${FULL_IMAGE}|g" \
+            -e "s|__BUILD_URL__|${BUILD_URL}|g" \
+            -e "s|__COMMIT_SHA__|${GITHUB_SHA}|g" \
+            cd_docker_check.rego
+
+          if grep -q '__ALLOWED_IMAGE__' cd_docker_check.rego; then
+            echo "::error::La sustitución del placeholder falló. La policy quedaría sin imagen fijada; aborto."
+            exit 1
+          fi
+          echo "--- rego que se va a publicar ---"
+          grep -n 'allowed_image' cd_docker_check.rego
+
+          jq -n --arg name "CD Docker Check" --rawfile rego cd_docker_check.rego \
+            '{name: $name, rego: $rego}' > policy_body.json
+
+          PATCHED=0
+          for SCOPE in "accountIdentifier=${ACCOUNT_ID}" \
+                       "accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}"; do
+            CODE="$(curl -sS -o patch_resp.json -w '%{http_code}' -X PATCH \
+              -H "x-api-key: ${HARNESS_API_KEY}" \
+              -H "Content-Type: application/json" \
+              "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_CD_ID}?${SCOPE}" \
+              -d @policy_body.json)"
+            echo "PATCH con '${SCOPE}' -> HTTP ${CODE}"
+            if [ "${CODE}" = "200" ] || [ "${CODE}" = "201" ]; then
+              PATCHED=1
+              break
+            fi
+            if [ "${CODE}" = "403" ]; then
+              echo "::error::403 en el PATCH: el token puede LEER pero no EDITAR policies."
+              echo "Dale permiso de edición sobre Governance/Policies al token de HARNESS_API_KEY."
+              cat patch_resp.json 2>/dev/null || true
+              exit 1
+            fi
+          done
+
+          if [ "${PATCHED}" != "1" ]; then
+            echo "::error::No pude actualizar la policy '${POLICY_CD_ID}'. Última respuesta:"
+            cat patch_resp.json 2>/dev/null || true
+            exit 1
+          fi
+          echo "Policy '${POLICY_CD_ID}' actualizada: allowed_image = ${FULL_IMAGE}"
+
+      # -----------------------------------------------------------------
+      #  Comprobación de que el PATCH quedó bien.
+      #
+      #  SÉ HONESTO CON LO QUE ESTO ES: no es un control de seguridad. El
+      #  Action acaba de escribir el valor que ahora comprueba, así que
+      #  siempre va a pasar — es circular por construcción.
+      #
+      #  Para lo que SÍ sirve, y por eso está aquí: confirma que el PATCH
+      #  llegó, que Harness devuelve el rego intacto por GET, que el rego
+      #  compila, y que la imagen fijada es la esperada. Si algo de eso
+      #  está roto, se descubre acá en 20 segundos en vez de en el stage
+      #  de CD dentro de varios minutos.
+      #
+      #  El control REAL contra desplegar otra imagen lo hace el pipeline
+      #  de CD (stage 'Verificar_Imagen_Autorizada'), que evalúa esta
+      #  misma policy sobre lo que de verdad se va a desplegar.
+      # -----------------------------------------------------------------
+      - name: Comprobar la policy publicada (round-trip, no es el control real)
+        env:
+          HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
+          POLICY_CD_ID: CD_Docker_Check
+          FULL_IMAGE: ${{ steps.pin_policy.outputs.full_image }}
+        run: |
+          set -euo pipefail
+
+          for SCOPE in "accountIdentifier=${ACCOUNT_ID}" \
+                       "accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}"; do
+            CODE="$(curl -sS -o get_resp.json -w '%{http_code}' \
+              -H "x-api-key: ${HARNESS_API_KEY}" \
+              "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_CD_ID}?${SCOPE}")"
+            echo "GET con '${SCOPE}' -> HTTP ${CODE}"
+            [ "${CODE}" = "200" ] && break
+          done
+
+          jq -r '.rego' get_resp.json > downloaded_policy.rego
+          if [ ! -s downloaded_policy.rego ] || [ "$(cat downloaded_policy.rego)" = "null" ]; then
+            echo "::error::El GET no devolvió un campo .rego usable. Respuesta:"
+            cat get_resp.json
+            exit 1
+          fi
+
+          # ¿Quedó fijada la imagen que este build publicó?
+          if ! grep -Fq "\"${FULL_IMAGE}\"" downloaded_policy.rego; then
+            echo "::error::La policy en Harness NO tiene fijada '${FULL_IMAGE}'. Contenido:"
+            cat downloaded_policy.rego
+            exit 1
+          fi
+          echo "La policy en Harness fija: ${FULL_IMAGE}"
+
+          # Caso positivo: la imagen buena debe pasar.
+          printf '{"image": "%s"}\n' "${FULL_IMAGE}" > input_ok.json
+          docker run --rm -v "${PWD}:/project" -w /project \
+            instrumenta/conftest:latest test input_ok.json -p downloaded_policy.rego
+
+          # Caso negativo: una imagen distinta DEBE ser rechazada. Sin esta
+          # comprobación, una policy vacía o mal generada pasaría el caso
+          # positivo y parecería que el gate funciona cuando no bloquea nada.
+          printf '{"image": "%s"}\n' "${FULL_IMAGE}-imagen-que-no-corresponde" > input_bad.json
+          if docker run --rm -v "${PWD}:/project" -w /project \
+               instrumenta/conftest:latest test input_bad.json -p downloaded_policy.rego; then
+            echo "::error::La policy ACEPTÓ una imagen que debía rechazar. No está protegiendo nada."
+            exit 1
+          fi
+          echo "OK: la policy acepta la imagen autorizada y rechaza cualquier otra."
+
       # -----------------------------------------------------------------
       #  'stageIdentifiers: ["Download_Policy","Build_and_Push","CD"]' dio
       #  400 ("either don't exist or have been deleted") — esos dos primeros
@@ -518,6 +714,10 @@ jobs:
           # pipeline no declara 'variables:' (caso actual), este bloque no
           # hace nada y no pasa nada.
           VAR_VALUES = {
+              # La consume el stage nuevo 'Verificar_Imagen_Autorizada':
+              # es la referencia completa (repo:tag) que conftest compara
+              # contra el allowed_image de la policy CD_Docker_Check.
+              "image_to_verify":   f"{APP_REPO}:{APP_TAG}",
               "app_image_repo":    APP_REPO,
               "app_image_tag":     APP_TAG,
               "env_type":          os.environ.get("ENV_TYPE", "PreProduction"),
