@@ -505,7 +505,7 @@ jobs:
               "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_CD_ID}?${SCOPE}" \
               -d @policy_body.json)"
             echo "PATCH con '${SCOPE}' -> HTTP ${CODE}"
-            if [ "${CODE}" = "200" ] || [ "${CODE}" = "201" ]; then
+            if [ "${CODE}" = "200" ] || [ "${CODE}" = "201" ] || [ "${CODE}" = "204" ]; then
               PATCHED=1
               break
             fi
