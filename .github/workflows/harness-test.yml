@@ -1,11 +1,46 @@
 # ===========================================================================
 #  hardening-reader-1-nodejs — build con gate de policy vía conftest
-#  y despliegue vía Harness CD genérico
+#
+#  Este workflow es el port EXACTO del pipeline de Harness CI que ya te
+#  funciona hoy ("Build and Push - Post Hardening"), traducido a GitHub
+#  Actions. No es mi diseño anterior (crane + Trivy + un schema de OPA
+#  inventado) — ese lo descarto aquí porque no es lo que está probado.
+#
+#  Mapeo de stages de Harness -> steps de este workflow:
+#
+#    Harness "Download Policy" (stage Custom, step Http)
+#      -> step "Descargar policy desde Harness" de este job
+#
+#    Harness "Build and Push" (stage CI)
+#      GitClone                      -> actions/checkout (ya estás en el repo)
+#      Run "Check Policy" (conftest) -> steps "Renderizar Dockerfile" + "Evaluar con conftest"
+#      BuildAndPushDockerRegistry    -> docker/build-push-action
+#
+#    Harness "CD" (stage Deployment, K8sRollingDeploy)
+#      -> job "deploy" de este workflow. NO se re-ejecuta el pipeline
+#         completo (eso duplicaría el build). Se dispara SOLO el stage CD
+#         vía la API de "Execute Specific Stages", pasándole el tag/repo
+#         que este mismo workflow acaba de construir y publicar. Ver el
+#         comentario grande sobre el job "deploy" más abajo.
+#
+#  Valores reales confirmados por el pipeline de Harness que pegaste:
+#    registry     : pkg.harness.io
+#    cuenta       : ucbjyokwry69wqkdogpexg
+#    org          : TPMDemos
+#    proyecto     : devops
+#    registry ref : harness-demo
+#    repo/imagen  : hardening-reader-1-nodejs
+#    base image   : pkg.harness.io/ucbjyokwry69wqkdogpexg/harness-demo/hardened-nodejs-image
+#    endpoint     : https://app.harness.io/gateway/pm/api/v1/policies/{id}   <- confirmado, con /gateway
 # ===========================================================================
 
 name: build-and-deploy
 
 on:
+  # En el pipeline de Harness, el trigger es el push de un TAG en este mismo
+  # repo, y el nombre del tag (sin 'refs/tags/') es lo que se inyecta como
+  # BASE_TAG. Mismo modelo aquí: tageas el repo con la versión de base image
+  # que quieres usar, y el push del tag dispara el build.
   push:
     tags:
       - "v*"
@@ -18,11 +53,21 @@ on:
 
 env:
   REGISTRY: pkg.harness.io
+  # Valor real, tal como viene embebido en tu token (sat.<accountId>.<...>).
+  # Antes tenía la versión en minúsculas que me habías pasado de palabra;
+  # el propio token reveló que el id real tiene mayúsculas mezcladas. Da
+  # igual para Docker (el paso "Normalizar el repo..." lo baja a minúsculas
+  # de todos modos), pero para las llamadas a la API de Harness conviene
+  # usar el valor exacto, por si acaso el backend es sensible a mayúsculas.
   ACCOUNT_ID: UCBJyOkwRy69wQkDOgpexg
   HARNESS_ORG_ID: TPMDemos
   HARNESS_PROJECT_ID: devops
   REGISTRY_REF: harness-demo
   APP_REPO: pkg.harness.io/UCBJyOkwRy69wQkDOgpexg/harness-demo/hardening-reader-1-nodejs
+
+  # AJUSTA: "DEBUG" es el identificador literal que usa hoy tu pipeline de
+  # Harness. Si es una policy de prueba y no la definitiva para el demo,
+  # cámbialo aquí antes del viernes.
   POLICY_ID: DEBUG
 
 jobs:
@@ -35,6 +80,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # -----------------------------------------------------------------
+      #  Equivalente a tu <+trigger.payload.ref.name.replace("refs/tags/","")>.
+      #  github.ref_name en un push de tag YA viene sin el prefijo 'refs/tags/',
+      #  así que aquí no hace falta el .replace().
+      # -----------------------------------------------------------------
       - name: Resolver BASE_TAG
         id: base
         run: |
@@ -53,8 +103,26 @@ jobs:
       - name: Calcular tag del artefacto
         id: tag
         run: |
+          # Mismo esquema que <+pipeline.sequenceId> de Harness: un contador
+          # que crece con cada ejecución. github.run_number es el equivalente.
           echo "app_tag=v.1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
+      # -----------------------------------------------------------------
+      #  Docker/OCI exige que el REPOSITORIO de un tag sea 100% minúsculas
+      #  (no es negociable — es la spec de distribution: cada segmento del
+      #  path solo admite [a-z0-9._-]). El tag en sí, después de los dos
+      #  puntos, sí puede tener mayúsculas; solo el repo no.
+      #
+      #  El pipeline nativo de Harness nunca choca con esto porque su step
+      #  BuildAndPushDockerRegistry no construye la URL a mano: recibe un
+      #  'repo' corto y un 'registryRef' abstracto, y Harness resuelve la URL
+      #  real del lado del servidor. Aquí SÍ se construye el string del tag
+      #  directamente para pasárselo a buildx, así que la regla aplica en
+      #  crudo. Se normaliza acá, una sola vez, para que no importe con qué
+      #  mayúsculas/minúsculas venga ACCOUNT_ID (el que se ve en la URL de
+      #  Harness, por ejemplo, no necesariamente coincide en case con el que
+      #  hace falta para el path de Docker).
+      # -----------------------------------------------------------------
       - name: Normalizar el repo de la imagen a minúsculas
         id: repo
         run: |
@@ -65,6 +133,20 @@ jobs:
           fi
           echo "app_repo=${LOWER}" >> "$GITHUB_OUTPUT"
 
+      # -----------------------------------------------------------------
+      #  Idéntico al step Http "Check Policy" del stage Download_Policy.
+      #  Mismo endpoint (con /gateway), mismo scope de query params, mismo
+      #  campo de salida (.rego). El secreto de Harness es
+      #  account.policy-api-token (a nivel de cuenta); aquí es un secreto
+      #  normal de GitHub con el mismo token.
+      # -----------------------------------------------------------------
+      #  Diagnóstico del secreto ANTES de usarlo.
+      #
+      #  Nunca imprime el valor. Solo longitud, prefijo y el accountId que
+      #  viene embebido en un token de Harness (pat.<accountId>.<...>). Si
+      #  esto falla, la llamada real de abajo va a dar 401 y ya sabrás por
+      #  qué sin tener que adivinar desde el log de curl.
+      # -----------------------------------------------------------------
       - name: Diagnóstico del secreto (sin exponerlo)
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -73,6 +155,9 @@ jobs:
 
           if [ -z "${HARNESS_API_KEY:-}" ]; then
             echo "::error::El secreto HARNESS_API_KEY llegó VACÍO a este step."
+            echo "Causas típicas: el secreto no existe en este repo, o su nombre"
+            echo "en GitHub no es EXACTAMENTE 'HARNESS_API_KEY' (mayúsculas incluidas)."
+            echo "Revisa: Settings > Secrets and variables > Actions."
             exit 1
           fi
 
@@ -84,20 +169,42 @@ jobs:
             pat.*|sat.*) echo "Formato OK (pat./sat.)" ;;
             *)
               echo "::warning::No empieza por 'pat.' ni 'sat.' — probablemente no es un token de API de Harness."
+              echo "Si al copiarlo quedaron comillas, un espacio o un salto de línea"
+              echo "al inicio/final, esto lo mostraría. Compara con lo que ves arriba."
               ;;
           esac
 
+          # El accountId va embebido en el token (segundo campo separado por '.').
+          # Si no coincide con ACCOUNT_ID, este token es de OTRA cuenta y el
+          # 401 es 100% esperado, sin importar si el token en sí es válido.
+          #
+          # OJO: la comparación es SIN distinguir mayúsculas. El accountId
+          # real de Harness puede venir con mayúsculas mezcladas (así lo trae
+          # el propio token), y no hay garantía de que quien configuró
+          # ACCOUNT_ID haya usado exactamente ese case. Comparar case-sensitive
+          # aquí dio un falso positivo real: bloqueó una ejecución por una
+          # diferencia de mayúsculas en la MISMA cuenta, no por cuentas
+          # distintas. Si de verdad son cuentas distintas, esto lo sigue
+          # detectando igual — cuentas distintas no coinciden ni ignorando case.
           TOKEN_ACCOUNT="$(echo "${HARNESS_API_KEY}" | cut -d'.' -f2)"
           if [ -n "${TOKEN_ACCOUNT}" ] && [ "${TOKEN_ACCOUNT}" != "${HARNESS_API_KEY}" ]; then
             TOKEN_ACCOUNT_LOWER="$(echo "${TOKEN_ACCOUNT}" | tr '[:upper:]' '[:lower:]')"
             ACCOUNT_ID_LOWER="$(echo "${ACCOUNT_ID}" | tr '[:upper:]' '[:lower:]')"
 
             if [ "${TOKEN_ACCOUNT_LOWER}" != "${ACCOUNT_ID_LOWER}" ]; then
-              echo "::error::El token pertenece a la cuenta '${TOKEN_ACCOUNT}', pero ACCOUNT_ID configurado es '${ACCOUNT_ID}'."
+              echo "::error::El token pertenece a la cuenta '${TOKEN_ACCOUNT}', pero ACCOUNT_ID configurado es '${ACCOUNT_ID}'. Son cuentas distintas incluso ignorando mayúsculas."
+              echo "Este token nunca va a autenticar contra esta cuenta. Genera uno nuevo"
+              echo "para la cuenta correcta, o corrige ACCOUNT_ID si el token es el bueno."
               exit 1
+            elif [ "${TOKEN_ACCOUNT}" != "${ACCOUNT_ID}" ]; then
+              echo "::warning::El accountId coincide, pero con mayúsculas distintas: token='${TOKEN_ACCOUNT}' vs ACCOUNT_ID='${ACCOUNT_ID}'."
+              echo "No bloquea (para Harness API probablemente da igual), pero conviene alinear ACCOUNT_ID al valor exacto del token."
+            else
+              echo "El accountId embebido en el token coincide con ACCOUNT_ID (${ACCOUNT_ID})."
             fi
           fi
 
+      # -----------------------------------------------------------------
       - name: Descargar policy desde Harness
         id: policy
         env:
@@ -110,17 +217,39 @@ jobs:
             -o policy_response.json || {
               CODE=$?
               echo "::error::curl falló (código ${CODE})."
+              if [ -s policy_response.json ]; then
+                echo "Cuerpo de la respuesta:"; cat policy_response.json
+              fi
+              case "${CODE}" in
+                22) echo "HTTP 4xx/5xx — revisa el step de diagnóstico anterior: si el" \
+                         "token está vacío o es de otra cuenta, la causa es esa, no la URL." ;;
+              esac
               exit 1
             }
 
           jq -r '.rego' policy_response.json > image_policy.rego
 
           if [ ! -s image_policy.rego ] || [ "$(cat image_policy.rego)" = "null" ]; then
-            echo "::error::La respuesta no trajo un campo .rego usable."
+            echo "::error::La respuesta no trajo un campo .rego usable. Contenido recibido:"
+            cat policy_response.json
             exit 1
           fi
-          echo "Policy '${POLICY_ID}' descargada."
 
+          echo "Policy '${POLICY_ID}' descargada: $(wc -c < image_policy.rego | tr -d ' ') caracteres de Rego"
+
+      # -----------------------------------------------------------------
+      #  Idéntico al bloque "Rendering the Dockerfile" del step Run/conftest.
+      #
+      #  OJO — esto es lo que te señalo aparte en el mensaje: este sed
+      #  reemplaza un placeholder LITERAL '${BASE_TAG}' en el texto del
+      #  Dockerfile. Si tu FROM real usa 'FROM imagen:${BASE_TAG}' (sustitución
+      #  nativa de Docker vía ARG), este sed sí tiene algo que reemplazar y
+      #  produce un Dockerfile ya resuelto para que conftest lo evalúe de
+      #  forma estática. Si en cambio tu FROM tiene una versión fija tecleada
+      #  a mano (ej. ':v1.0.41'), este sed no encuentra nada que sustituir y
+      #  rendered.Dockerfile sale idéntico al original: el BASE_TAG del
+      #  trigger deja de tener efecto sobre qué se construye.
+      # -----------------------------------------------------------------
       - name: Renderizar Dockerfile con BASE_TAG
         env:
           BASE_TAG_VALUE: ${{ steps.base.outputs.base_tag }}
@@ -131,6 +260,13 @@ jobs:
           echo "--- FROM resultante ---"
           grep -i '^FROM' rendered.Dockerfile || echo "(sin línea FROM — revisa el Dockerfile)"
 
+      # -----------------------------------------------------------------
+      #  Idéntico al "conftest test rendered.Dockerfile -p image_policy.rego"
+      #  que corre dentro del step Run de Harness (imagen instrumenta/conftest).
+      #  Aquí se invoca el mismo contenedor vía docker run, ya que GitHub
+      #  Actions no tiene un equivalente directo a "este Run step corre
+      #  dentro de esta imagen" a nivel de step individual.
+      # -----------------------------------------------------------------
       - name: Evaluar con conftest
         run: |
           set -euo pipefail
@@ -145,6 +281,15 @@ jobs:
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_TOKEN }}
 
+      # -----------------------------------------------------------------
+      #  Idéntico al step BuildAndPushDockerRegistry.
+      #
+      #  Ojo: el build usa el Dockerfile ORIGINAL (con el ARG BASE_TAG),
+      #  no rendered.Dockerfile. rendered.Dockerfile existe solo para que
+      #  conftest pueda analizar un FROM ya resuelto; el build real deja que
+      #  Docker resuelva ${BASE_TAG} de forma nativa vía --build-arg, igual
+      #  que hace el step de Harness con buildArgs.BASE_TAG.
+      # -----------------------------------------------------------------
       - name: Build y push
         uses: docker/build-push-action@v6
         with:
@@ -170,7 +315,43 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  #  deploy — dispara el NUEVO pipeline de Harness (CD - Deploy con Policy Gate)
+  #  deploy — dispara el pipeline de Harness "CD - Deploy con Policy Gate"
+  #  (identifier: cd_deploy_policy_gate).
+  #
+  #  CAMBIO DE PIPELINE OBJETIVO: ya no apunta a Build_and_Push_Post_Hardening
+  #  (el pipeline CI/CD real con el que se probó todo el mecanismo de
+  #  conftest). Ahora apunta al pipeline separado que armé al principio de
+  #  esta conversación (pipelines/cd_deploy_policy_gate.yaml) — confirmaste
+  #  que lo creaste en Harness y que es al que este Action debe apuntar.
+  #
+  #  OJO — dos cosas que noté al comparar tu YAML real contra el que yo
+  #  armé, que no puedo arreglar desde este Action porque son del lado del
+  #  pipeline en Harness, no del caller:
+  #
+  #  1. El YAML que confirmaste solo tiene el stage "deploy". El diseño
+  #     original tenía TAMBIÉN un stage "predeploy_gate" (CI) antes, que
+  #     evaluaba la policy con OPA/Trivy. Si lo borraste a propósito porque
+  #     ese gate ya lo hace GitHub Actions con conftest, perfecto, es
+  #     coherente. Pero el step "Registrar veredicto del gate" del stage
+  #     "deploy" TODAVÍA reference expresiones a ese stage borrado:
+  #       <+pipeline.stages.predeploy_gate.spec.execution.steps.evaluate_gate...>
+  #       <+pipeline.stages.predeploy_gate.spec.execution.steps.fetch_policy...>
+  #     Si el stage "predeploy_gate" ya no existe, esas expresiones no van a
+  #     resolver nada — revisa ese step en Harness (o bórralo, o restaura el
+  #     stage) antes del demo, porque puede fallar el deploy por algo que no
+  #     tiene que ver con el gate real.
+  #
+  #  2. Las variables 'policy_identifier' y 'run_artifact_scan' del pipeline
+  #     solo tenían sentido para alimentar ese stage "predeploy_gate" que ya
+  #     no está. Sin ese stage, son vestigiales — se les pone un valor válido
+  #     abajo para que Harness no rechace el runtime input, pero no tienen
+  #     ningún efecto real hoy.
+  #
+  #  LO QUE SIGUE SIN CONFIRMAR — variables de abajo con "AJUSTA": no puedo
+  #  saber el Service/Environment/Infrastructure real de tu proyecto sin que
+  #  me los confirmes. Si las dejas con el placeholder, el step de abajo
+  #  falla explícitamente pidiéndolos, en vez de adivinar un identifier que
+  #  podría desplegar al ambiente equivocado.
   # =========================================================================
   deploy:
     needs: build
@@ -179,14 +360,41 @@ jobs:
       HARNESS_PIPELINE_ID: cd_deploy_policy_gate
       APP_TAG: ${{ needs.build.outputs.app_tag }}
       APP_REPO: ${{ needs.build.outputs.app_repo }}
-      
-      ENV_TYPE: PreProduction
+
+      # Variables de pipeline (cd_deploy_policy_gate.variables). app_image_repo
+      # y app_image_tag se llenan solas desde el build. Las demás:
+      ENV_TYPE: PreProduction        # AJUSTA si el demo despliega a Production
+      CHANGE_NUMBER: ""              # obligatorio solo si ENV_TYPE=Production
+      RUN_ARTIFACT_SCAN: "false"     # vestigial — no tiene efecto sin el stage predeploy_gate
+
+      # Identifier y type de la artifact source, tal como están en el
+      # Service "TEST". Son la llave con la que Harness empareja el override
+      # del pipeline contra la source del Service: si no coinciden, Harness
+      # descarta el bloque y el tag nunca llega (es exactamente el bug que
+      # causaba el "Failed to complete service step").
+      ARTIFACT_SOURCE_ID: Harness
+      ARTIFACT_SOURCE_TYPE: Har
+
+      # Service/Environment/Infra: en el pipeline actual están FIJOS
+      # (serviceRef: TEST, environmentRef: TEST, infra TEST), así que no
+      # aparecen en el template y estos valores no se usan. Se dejan puestos
+      # con el valor real para que, si algún día los pasas a <+input>, el
+      # Action ya sepa qué mandar sin tocar nada más.
       SERVICE_REF: TEST
       ENV_REF: TEST
-      INFRA_DEF: TEST
-
+      INFRA_DEF: TEST                # admite varios separados por coma
     steps:
-      - name: Obtener el template de runtime inputs del pipeline
+      # -----------------------------------------------------------------
+      #  'stageIdentifiers: ["Download_Policy","Build_and_Push","CD"]' dio
+      #  400 ("either don't exist or have been deleted") — esos dos primeros
+      #  identifiers eran mi lectura de nombres descriptivos del pipeline
+      #  pegado hace rato, no confirmados como identifier real (case exacto,
+      #  guiones bajos, etc.). En vez de adivinar de nuevo, se pide el
+      #  template SIN restringir por stage (se omite 'stageIdentifiers' del
+      #  body) — así Harness devuelve el template del pipeline completo con
+      #  los identifiers reales, sea cual sea su forma exacta.
+      # -----------------------------------------------------------------
+      - name: Obtener el template de runtime inputs del pipeline completo
         id: template
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -200,6 +408,7 @@ jobs:
               -H "Content-Type: application/json" \
               "https://app.harness.io${PREFIX}/pipeline/api/inputSets/template?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&pipelineIdentifier=${HARNESS_PIPELINE_ID}" \
               -d '{}')"
+            echo "Prefijo '${PREFIX}' -> HTTP ${CODE}"
             HTTP_CODE="${CODE}"
             if [ "${CODE}" = "200" ]; then
               FOUND_PREFIX="${PREFIX}"
@@ -208,122 +417,294 @@ jobs:
           done
 
           if [ "${HTTP_CODE}" != "200" ]; then
-            echo "::error::Fallo obteniendo template. Código HTTP: ${HTTP_CODE}"
+            echo "::error::Ningún prefijo respondió 200 para /pipeline/api/inputSets/template (último código: ${HTTP_CODE}). Respuesta:"
             cat response.json 2>/dev/null || true
             exit 1
           fi
 
           TEMPLATE_YAML="$(jq -r '.data.inputSetTemplateYaml // .inputSetTemplateYaml // empty' response.json)"
+          if [ -z "${TEMPLATE_YAML}" ] || [ "${TEMPLATE_YAML}" = "null" ]; then
+            echo "::error::La respuesta no trajo inputSetTemplateYaml. Contenido recibido:"
+            cat response.json
+            echo "Si esto vino vacío (sin campo .data), puede ser que el pipeline no tenga NINGÚN runtime input pendiente fuera de lo que ya está fijo — en ese caso el runtimeInputYaml a mandar sería solo el esqueleto del pipeline sin overrides, avísame para ajustar el step siguiente a ese caso."
+            exit 1
+          fi
+
           echo "prefix=${FOUND_PREFIX}" >> "$GITHUB_OUTPUT"
           echo "${TEMPLATE_YAML}" > template.yaml
+          echo "--- Template de runtime inputs (pipeline completo) ---"
+          cat template.yaml
 
-      - name: Llenar el runtime_input.yaml
+      # -----------------------------------------------------------------
+      #  Rellenar el runtime input.
+      #
+      #  REESCRITO tras encontrar el bug real del "Failed to complete
+      #  service step". Dos cosas que la version anterior daba por buenas
+      #  y no lo eran:
+      #
+      #  1. El template NO siempre trae el literal '<+input>'. Para este
+      #     pipeline la API devolvio los campos como cadenas VACIAS ('') y,
+      #     los declarados con .default("x"), como el string '"x"' con las
+      #     comillas metidas DENTRO del valor. Un resolver que busca
+      #     '<+input>' no encuentra nada, no rellena nada, y su chequeo de
+      #     "no quedan inputs pendientes" pasa en verde mientras manda a
+      #     Harness un runtime input con todo vacio. Eso es exactamente lo
+      #     que paso: primaryArtifactRef llego como '', el stage se quedo
+      #     sin artefacto, y el service step murio justo despues de
+      #     "Adding manifest from service".
+      #
+      #  2. Por eso este script ya no busca placeholders: rellena por
+      #     NOMBRE de variable y por RUTA conocida, y al final AUDITA que no
+      #     quede ningun valor vacio, nulo, con comillas literales ni con
+      #     '<+input>'. Si algo queda a medias, falla con la ruta exacta en
+      #     vez de desplegar con datos vacios.
+      #
+      #  Solo rellena claves que el template PIDE: si el pipeline tiene un
+      #  campo fijo (serviceRef: TEST), no aparece en el template y no se
+      #  inyecta.
+      # -----------------------------------------------------------------
+      - name: Rellenar y auditar el runtime input
         id: build_input
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os
-          import sys
-          import yaml
+          import os, sys, yaml
+
+          APP_TAG      = os.environ["APP_TAG"]
+          APP_REPO     = os.environ["APP_REPO"]
+          REGISTRY_REF = os.environ["REGISTRY_REF"]
+          ART_ID       = os.environ.get("ARTIFACT_SOURCE_ID", "Harness")
+          ART_TYPE     = os.environ.get("ARTIFACT_SOURCE_TYPE", "Har")
+          # imagePath en una source 'Har' es solo el nombre de la imagen: el
+          # host, la cuenta y el registry ya van implicitos en registryRef.
+          IMAGE_PATH   = APP_REPO.rstrip("/").rsplit("/", 1)[-1]
+
+          def needs_fill(v):
+              """'<+input>', '', '""' y None son todas formas en que este
+              template expresa "esto hay que rellenarlo"."""
+              if v is None:
+                  return True
+              if isinstance(v, str):
+                  s = v.strip()
+                  return s == "" or s in ('""', "''") or s.startswith("<+input>")
+              return False
+
+          def unquote(v):
+              """<+input>.default("x") vuelve como el string '"x"' — con las
+              comillas como caracteres. Sin quitarlas, run_artifact_scan
+              llega como la cadena de 6 chars y allowedValues la rechaza."""
+              if isinstance(v, str) and len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                  return v[1:-1]
+              return v
 
           with open("template.yaml") as f:
               template = yaml.safe_load(f)
-
           pipeline = template.get("pipeline", template) if isinstance(template, dict) else None
-          
-          APP_TAG = os.environ["APP_TAG"]
-          APP_REPO = os.environ["APP_REPO"]
-          REGISTRY_REF = os.environ.get("REGISTRY_REF", "harness-demo")
-          IMAGE_PATH = APP_REPO.rstrip("/").rsplit("/", 1)[-1]
-          ENV_TYPE = os.environ["ENV_TYPE"]
-          SERVICE_REF = os.environ["SERVICE_REF"]
-          ENV_REF = os.environ["ENV_REF"]
-          INFRA_DEF = os.environ["INFRA_DEF"]
-
-          # 1. Resolver las Pipeline Variables
-          variables = pipeline.get("variables", [])
-          for var in variables:
-              name = var.get("name")
-              val = str(var.get("value", ""))
-              if "<+input>" in val:
-                  if name == "app_image_repo": var["value"] = IMAGE_PATH
-                  elif name == "app_image_tag": var["value"] = APP_TAG
-                  elif name == "env_type": var["value"] = ENV_TYPE
-                  elif name == "change_number": var["value"] = ""
-                  elif name == "run_artifact_scan": var["value"] = "true"
-
-          # 2. Navegar el árbol de forma segura y reemplazar <+input> en sitio
-          # Esto evita romper el formato que Harness espera nativamente.
-          def resolve_inputs(node):
-              if isinstance(node, dict):
-                  for k, v in list(node.items()):
-                      if isinstance(v, str) and "<+input>" in v:
-                          if k == "serviceRef": 
-                              node[k] = SERVICE_REF
-                          elif k == "environmentRef": 
-                              node[k] = ENV_REF
-                          elif k == "primaryArtifactRef": 
-                              node[k] = "Harness"
-                          elif k == "sources":
-                              node[k] = [{
-                                  "identifier": "Harness",
-                                  "type": "Har",
-                                  "spec": {
-                                      "registryRef": REGISTRY_REF,
-                                      "type": "docker",
-                                      "spec": {
-                                          "imagePath": IMAGE_PATH,
-                                          "tag": APP_TAG,
-                                          "digest": ""
-                                      }
-                                  }
-                              }]
-                          elif k == "infrastructureDefinitions":
-                              node[k] = [{"identifier": INFRA_DEF}]
-                          elif k == "identifier": 
-                              node[k] = INFRA_DEF
-                      else:
-                          resolve_inputs(v)
-              elif isinstance(node, list):
-                  for item in node:
-                      resolve_inputs(item)
-
-          resolve_inputs(pipeline)
-
-          # 3. Validar que no queden <+input> sueltos
-          def find_unresolved(node, path="pipeline"):
-              found = []
-              if isinstance(node, dict):
-                  for k, v in node.items():
-                      found += find_unresolved(v, f"{path}.{k}")
-              elif isinstance(node, list):
-                  for i, v in enumerate(node):
-                      found += find_unresolved(v, f"{path}[{i}]")
-              elif isinstance(node, str) and "<+input>" in node:
-                  found.append((path, node))
-              return found
-
-          unresolved = find_unresolved(pipeline)
-          if unresolved:
-              print("::error::Quedaron runtime inputs sin resolver:")
-              for path, value in unresolved:
-                  print(f"  {path} = {value}")
+          if not pipeline:
+              print("::error::template.yaml no parseo como un dict con 'pipeline'.")
               sys.exit(1)
 
-          # 4. Volcar a YAML evitando aliases (&id001) que causan el error 400 Invalid Format
-          class NoAliasDumper(yaml.SafeDumper):
+          # ---------- 1) Variables de pipeline, por NOMBRE ----------
+          VAR_VALUES = {
+              "app_image_repo":    APP_REPO,
+              "app_image_tag":     APP_TAG,
+              "env_type":          os.environ["ENV_TYPE"],
+              "change_number":     os.environ["CHANGE_NUMBER"],
+              "run_artifact_scan": os.environ["RUN_ARTIFACT_SCAN"],
+          }
+          # Variables donde un valor vacio SI es legitimo (.default("")).
+          ALLOW_EMPTY_VARS = {"change_number"}
+          allow_empty_paths = set()
+
+          for i, var in enumerate(pipeline.get("variables") or []):
+              name = var.get("name")
+              if name in VAR_VALUES:
+                  var["value"] = VAR_VALUES[name]
+                  print(f"variable '{name}' = {VAR_VALUES[name]!r}")
+              else:
+                  var["value"] = unquote(var.get("value"))
+              if var.get("value") == "" and name in ALLOW_EMPTY_VARS:
+                  allow_empty_paths.add(f"pipeline.variables[{i}].value")
+
+          # ---------- 2) Stage 'deploy' ----------
+          stages = pipeline.get("stages") or []
+          stage = None
+          for s in stages:
+              st = s.get("stage", s) if isinstance(s, dict) else None
+              if st and st.get("identifier") == "deploy":
+                  stage = st
+                  break
+          if stage is None:
+              ids = [((s.get("stage", s) or {}).get("identifier")) for s in stages]
+              print(f"::error::No hay stage con identifier 'deploy'. Presentes: {ids}")
+              sys.exit(1)
+
+          # El template puede anidar service/environment directo bajo el
+          # stage o un nivel mas adentro bajo 'spec'.
+          root = stage if stage.get("service") is not None else (stage.get("spec") or stage)
+
+          service = root.get("service")
+          if service is None:
+              print(f"::error::No hay 'service' en el stage. Claves: {list(stage.keys())}")
+              sys.exit(1)
+
+          if "serviceRef" in service and needs_fill(service.get("serviceRef")):
+              ref = os.environ.get("SERVICE_REF", "")
+              if not ref:
+                  print("::error::serviceRef es runtime input y SERVICE_REF esta vacio.")
+                  sys.exit(1)
+              service["serviceRef"] = ref
+              print(f"service.serviceRef = {ref!r}")
+
+          env_block = root.get("environment")
+          if env_block is not None:
+              if "environmentRef" in env_block and needs_fill(env_block.get("environmentRef")):
+                  r = os.environ.get("ENV_REF", "")
+                  if not r:
+                      print("::error::environmentRef es runtime input y ENV_REF esta vacio.")
+                      sys.exit(1)
+                  env_block["environmentRef"] = r
+                  print(f"environment.environmentRef = {r!r}")
+              if "infrastructureDefinitions" in env_block and needs_fill(env_block.get("infrastructureDefinitions")):
+                  r = os.environ.get("INFRA_DEF", "")
+                  if not r:
+                      print("::error::infrastructureDefinitions es runtime input y INFRA_DEF esta vacio.")
+                      sys.exit(1)
+                  env_block["infrastructureDefinitions"] = [
+                      {"identifier": i.strip()} for i in r.split(",") if i.strip()
+                  ]
+                  print(f"environment.infrastructureDefinitions = {env_block['infrastructureDefinitions']!r}")
+
+          # ---------- 3) Artifact source ----------
+          HAR_SOURCE = {
+              "identifier": ART_ID,
+              "type": ART_TYPE,
+              "spec": {
+                  "registryRef": REGISTRY_REF,
+                  "type": "docker",
+                  "spec": {"imagePath": IMAGE_PATH, "tag": APP_TAG, "digest": ""},
+              },
+          }
+
+          si = service.get("serviceInputs")
+          if needs_fill(si):
+              service["serviceInputs"] = {"serviceDefinition": {"type": "Kubernetes", "spec": {
+                  "artifacts": {"primary": {"primaryArtifactRef": ART_ID, "sources": [HAR_SOURCE]}}}}}
+              print("serviceInputs reconstruido completo")
+          else:
+              try:
+                  primary = si["serviceDefinition"]["spec"]["artifacts"]["primary"]
+              except (KeyError, TypeError) as e:
+                  print(f"::error::No pude navegar serviceInputs.serviceDefinition.spec.artifacts.primary ({e}).")
+                  sys.exit(1)
+
+              primary["primaryArtifactRef"] = ART_ID
+
+              if "sources" not in primary:
+                  print("::error::=========================================================")
+                  print("::error::El template NO pide 'sources' bajo artifacts.primary.")
+                  print("::error::Sin ese bloque el TAG del artefacto nunca llega a Harness:")
+                  print("::error::el stage se queda sin artefacto y el service step falla")
+                  print("::error::justo despues de 'Adding manifest from service'.")
+                  print("::error::")
+                  print("::error::Causa: el override de 'sources' en el PIPELINE no lleva")
+                  print("::error::'identifier' ni 'type'. Harness empareja las artifact")
+                  print("::error::sources POR IDENTIFIER contra las del Service; sin el,")
+                  print("::error::descarta el bloque entero y no lo pide como input.")
+                  print("::error::")
+                  print("::error::Arreglo, en el pipeline:")
+                  print("::error::  sources:")
+                  print(f"::error::    - identifier: {ART_ID}")
+                  print(f"::error::      type: {ART_TYPE}")
+                  print("::error::      spec:")
+                  print("::error::        registryRef: <+input>")
+                  print("::error::        type: docker")
+                  print("::error::        spec:")
+                  print("::error::          imagePath: <+input>")
+                  print("::error::          tag: <+input>")
+                  print("::error::          digest: \"\"")
+                  print("::error::=========================================================")
+                  sys.exit(1)
+
+              srcs = primary.get("sources")
+              if needs_fill(srcs):
+                  primary["sources"] = [HAR_SOURCE]
+                  print("sources reconstruido completo")
+              elif isinstance(srcs, list) and len(srcs) == 1:
+                  src = srcs[0]
+                  src.setdefault("identifier", ART_ID)
+                  src.setdefault("type", ART_TYPE)
+                  sp = src.setdefault("spec", {})
+                  if needs_fill(sp.get("registryRef")):
+                      sp["registryRef"] = REGISTRY_REF
+                  sp.setdefault("type", "docker")
+                  inner = sp.setdefault("spec", {})
+                  if needs_fill(inner.get("imagePath")):
+                      inner["imagePath"] = IMAGE_PATH
+                  inner["tag"] = APP_TAG
+                  inner.setdefault("digest", "")
+                  print(f"source '{src.get('identifier')}': registryRef={sp.get('registryRef')!r} imagePath={inner.get('imagePath')!r} tag={inner.get('tag')!r}")
+              else:
+                  print(f"::error::'sources' con forma inesperada: {srcs!r}")
+                  sys.exit(1)
+
+          # ---------- 4) Auditoria final ----------
+          #  Este es el chequeo que faltaba. No busca '<+input>': busca
+          #  CUALQUIER valor que Harness no pueda usar.
+          def audit(node, path="pipeline"):
+              bad = []
+              if isinstance(node, dict):
+                  for k, v in node.items():
+                      bad += audit(v, f"{path}.{k}")
+              elif isinstance(node, list):
+                  for i, v in enumerate(node):
+                      bad += audit(v, f"{path}[{i}]")
+              elif isinstance(node, str):
+                  s = node.strip()
+                  if s.startswith("<+input>"):
+                      bad.append((path, node, "sin resolver"))
+                  elif s in ('""', "''"):
+                      bad.append((path, node, "comillas literales de un .default()"))
+                  elif s == "" and not path.endswith(".digest") and path not in allow_empty_paths:
+                      bad.append((path, node, "vacio"))
+              elif node is None:
+                  bad.append((path, node, "null"))
+              return bad
+
+          problems = audit(pipeline)
+          if problems:
+              print("::error::El runtime input quedo incompleto. NO se manda asi a Harness:")
+              for p, v, why in problems:
+                  print(f"  {p} = {v!r}   <- {why}")
+              print("Pega esta lista y el template.yaml de arriba para ajustarlo.")
+              sys.exit(1)
+
+          class NoAlias(yaml.SafeDumper):
+              # Sin esto PyYAML puede emitir anclas/alias (&id001 / *id001)
+              # cuando dos ramas comparten el mismo objeto, y Harness rechaza
+              # ese YAML con un 400 de formato invalido.
               def ignore_aliases(self, data):
                   return True
 
           with open("runtime_input.yaml", "w") as f:
-              yaml.dump({"pipeline": pipeline}, f, Dumper=NoAliasDumper, sort_keys=False)
-          print("runtime_input.yaml armado correctamente.")
+              yaml.dump({"pipeline": pipeline}, f, Dumper=NoAlias, sort_keys=False)
+
+          print("runtime_input.yaml completo y auditado: sin vacios ni placeholders.")
           PY
-          
-          echo "--- runtime_input.yaml generado ---"
+
+          echo "--- runtime_input.yaml ---"
           cat runtime_input.yaml
 
-      - name: Disparar el pipeline en Harness
+      # -----------------------------------------------------------------
+      #  Endpoint de ejecución NORMAL (pipeline completo), sin '/stages':
+      #  el pipeline no tiene habilitado "Allow selective stage(s)
+      #  executions", así que el endpoint de stage puntual devuelve 400
+      #  ("Stage executions are not allowed for pipeline [...]"). Confirmado
+      #  en https://apidocs.harness.io/pipeline-execute. El body ya no lleva
+      #  'stageIdentifiers' ni 'expressionValues' — solo 'runtimeInputYaml',
+      #  que es lo único que ese endpoint espera.
+      # -----------------------------------------------------------------
+      - name: Disparar el pipeline completo en Harness
         id: trigger
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -332,7 +713,10 @@ jobs:
           PREFIX="${{ steps.template.outputs.prefix }}"
 
           BODY_FILE="$(mktemp)"
-          jq -n --rawfile yaml runtime_input.yaml '{runtimeInputYaml: $yaml}' > "${BODY_FILE}"
+          jq -n \
+            --rawfile yaml runtime_input.yaml \
+            '{runtimeInputYaml: $yaml}' \
+            > "${BODY_FILE}"
 
           curl -sS --fail-with-body -o exec_response.json -X POST \
             -H "x-api-key: ${HARNESS_API_KEY}" \
@@ -345,9 +729,21 @@ jobs:
             }
 
           EXEC_ID="$(jq -r '.data.planExecution.uuid // empty' exec_response.json)"
+          if [ -z "${EXEC_ID}" ]; then
+            echo "::error::No pude extraer planExecution.uuid. Respuesta completa:"
+            cat exec_response.json
+            exit 1
+          fi
+
           echo "exec_id=${EXEC_ID}" >> "$GITHUB_OUTPUT"
           echo "Ejecución del pipeline disparada: ${EXEC_ID}"
 
+      # -----------------------------------------------------------------
+      #  El control vuelve a GitHub Actions con el resultado real — no hace
+      #  falta entrar a la consola de Harness para saber si terminó bien.
+      #  Es el status del PIPELINE completo (Download_Policy + Build_and_Push
+      #  + CD), ya no solo del stage CD, porque ahora se ejecuta todo junto.
+      # -----------------------------------------------------------------
       - name: Esperar resultado de la ejecución
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -363,13 +759,17 @@ jobs:
               | jq -r '.data.pipelineExecutionSummary.status // "Unknown"')"
 
             echo "[$i] Estado: ${STATUS}"
+
             case "${STATUS}" in
-              Success) exit 0 ;;
+              Success)
+                echo "Pipeline completado (Download_Policy + Build_and_Push + CD)."
+                exit 0 ;;
               Failed|Aborted|Errored|Expired|ApprovalRejected)
-                echo "::error::La ejecución terminó en ${STATUS}."
+                echo "::error::La ejecución terminó en ${STATUS}. Revisa el pipeline en Harness — puede haber fallado en Download_Policy o Build_and_Push, no necesariamente en CD."
                 exit 1 ;;
             esac
             sleep 15
           done
-          echo "::error::Timeout esperando la ejecución."
+
+          echo "::error::Timeout esperando la ejecución del pipeline."
           exit 1
