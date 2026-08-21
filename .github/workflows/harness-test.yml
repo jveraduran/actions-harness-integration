@@ -1,5 +1,5 @@
 # ===========================================================================
-#  hardening-reader-1-nodejs — build con gate de policy vía conftest
+#  hardening-reader-1-nodejs — build with policy gate via conftest
 # ===========================================================================
 
 name: build-and-deploy
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       base_tag:
-        description: "Tag de la base image a inyectar (ej. v1.0.42). Vacío = usar el del git tag que disparó el workflow."
+        description: "Base image tag to inject (e.g., v1.0.42). Empty = use the git tag that triggered the workflow."
         required: false
         default: ""
 
@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolver BASE_TAG
+      - name: Resolve BASE_TAG
         id: base
         run: |
           set -euo pipefail
@@ -43,45 +43,45 @@ jobs:
           elif [ "${{ github.ref_type }}" = "tag" ]; then
             BASE_TAG="${{ github.ref_name }}"
           else
-            echo "::error::Este workflow espera un push de tag (v*) o un base_tag manual vía workflow_dispatch."
+            echo "::error::This workflow expects a tag push (v*) or a manual base_tag via workflow_dispatch."
             exit 1
           fi
-          echo "BASE_TAG resuelto: ${BASE_TAG}"
+          echo "Resolved BASE_TAG: ${BASE_TAG}"
           echo "base_tag=${BASE_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Calcular tag del artefacto
+      - name: Calculate artifact tag
         id: tag
         run: |
           echo "app_tag=v.1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
-      - name: Normalizar el repo de la imagen a minúsculas
+      - name: Normalize image repo to lowercase
         id: repo
         run: |
           set -euo pipefail
           LOWER="$(echo "${APP_REPO}" | tr '[:upper:]' '[:lower:]')"
           if [ "${LOWER}" != "${APP_REPO}" ]; then
-            echo "::warning::APP_REPO tenía mayúsculas ('${APP_REPO}'). Docker las rechaza en el repo (no en el tag). Usando '${LOWER}'."
+            echo "::warning::APP_REPO contained uppercase letters ('${APP_REPO}'). Docker rejects them in the repo (not in the tag). Using '${LOWER}'."
           fi
           echo "app_repo=${LOWER}" >> "$GITHUB_OUTPUT"
 
-      - name: Diagnóstico del secreto (sin exponerlo)
+      - name: Secret diagnostics (without exposing it)
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${HARNESS_API_KEY:-}" ]; then
-            echo "::error::El secreto HARNESS_API_KEY llegó VACÍO a este step."
+            echo "::error::The HARNESS_API_KEY secret arrived EMPTY at this step."
             exit 1
           fi
           LEN="${#HARNESS_API_KEY}"
           PREFIX="${HARNESS_API_KEY:0:4}"
-          echo "Longitud: ${LEN} caracteres. Empieza por: '${PREFIX}'"
+          echo "Length: ${LEN} characters. Starts with: '${PREFIX}'"
           case "${HARNESS_API_KEY}" in
-            pat.*|sat.*) echo "Formato OK (pat./sat.)" ;;
-            *) echo "::warning::No empieza por 'pat.' ni 'sat.'" ;;
+            pat.*|sat.*) echo "Format OK (pat./sat.)" ;;
+            *) echo "::warning::Does not start with 'pat.' or 'sat.'" ;;
           esac
 
-      - name: Descargar policy desde Harness
+      - name: Download policy from Harness
         id: policy
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -92,27 +92,27 @@ jobs:
             "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
             -o policy_response.json || {
               CODE=$?
-              echo "::error::curl falló (código ${CODE})."
+              echo "::error::curl failed (code ${CODE})."
               if [ -s policy_response.json ]; then cat policy_response.json; fi
               exit 1
             }
 
           jq -r '.rego' policy_response.json > image_policy.rego
           if [ ! -s image_policy.rego ] || [ "$(cat image_policy.rego)" = "null" ]; then
-            echo "::error::La respuesta no trajo un campo .rego usable."
+            echo "::error::The response did not return a usable .rego field."
             exit 1
           fi
 
-      - name: Renderizar Dockerfile con BASE_TAG
+      - name: Render Dockerfile with BASE_TAG
         env:
           BASE_TAG_VALUE: ${{ steps.base.outputs.base_tag }}
         run: |
           set -euo pipefail
-          echo "Tag a inyectar: ${BASE_TAG_VALUE}"
+          echo "Tag to inject: ${BASE_TAG_VALUE}"
           sed "s|\${BASE_TAG}|${BASE_TAG_VALUE}|g" Dockerfile > rendered.Dockerfile
           grep -i '^FROM' rendered.Dockerfile || true
 
-      - name: Evaluar con conftest
+      - name: Evaluate with conftest
         run: |
           set -euo pipefail
           docker run --rm \
@@ -126,7 +126,7 @@ jobs:
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_TOKEN }}
 
-      - name: Build y push
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -136,18 +136,18 @@ jobs:
             BASE_TAG=${{ steps.base.outputs.base_tag }}
           tags: ${{ steps.repo.outputs.app_repo }}:${{ steps.tag.outputs.app_tag }}
 
-      - name: Resumen
+      - name: Summary
         env:
           APP_REPO_LOWER: ${{ steps.repo.outputs.app_repo }}
         run: |
           {
-            echo "### Artefacto publicado"
+            echo "### Published Artifact"
             echo ""
-            echo "| Campo | Valor |"
+            echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Imagen | \`${APP_REPO_LOWER}:${{ steps.tag.outputs.app_tag }}\` |"
-            echo "| BASE_TAG inyectado | \`${{ steps.base.outputs.base_tag }}\` |"
-            echo "| Policy evaluada | \`${POLICY_ID}\` |"
+            echo "| Image | \`${APP_REPO_LOWER}:${{ steps.tag.outputs.app_tag }}\` |"
+            echo "| Injected BASE_TAG | \`${{ steps.base.outputs.base_tag }}\` |"
+            echo "| Evaluated Policy | \`${POLICY_ID}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
@@ -166,7 +166,7 @@ jobs:
       ENV_REF: TEST
       INFRA_DEF: TEST
     steps:
-      - name: Fijar la imagen autorizada en la policy de Harness
+      - name: Set authorized image in Harness policy
         id: pin_policy
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -174,7 +174,7 @@ jobs:
         run: |
           set -euo pipefail
           FULL_IMAGE="${APP_REPO}:${APP_TAG}"
-          echo "Imagen a autorizar: ${FULL_IMAGE}"
+          echo "Image to authorize: ${FULL_IMAGE}"
           echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
 
           cat > cd_docker_check.rego << 'REGO'
@@ -184,12 +184,12 @@ jobs:
 
           deny[msg] {
               input.image != allowed_image
-              msg := sprintf("Imagen no autorizada: '%v'. La unica permitida es '%v'.", [input.image, allowed_image])
+              msg := sprintf("Unauthorized image: '%v'. The only allowed image is '%v'.", [input.image, allowed_image])
           }
 
           deny[msg] {
               not input.image
-              msg := "El input no declara el campo 'image'. Bloqueado por defecto."
+              msg := "The input does not declare the 'image' field. Blocked by default."
           }
           REGO
 
@@ -209,25 +209,25 @@ jobs:
               -H "Content-Type: application/json" \
               "https://app.harness.io/gateway/pm/api/v1/policies/${POLICY_CD_ID}?${SCOPE}" \
               -d @policy_body.json)"
-            echo "PATCH con '${SCOPE}' -> HTTP ${CODE}"
-            # AQUÍ ESTÁ EL PARCHE DEL CÓDIGO 204
+            echo "PATCH with '${SCOPE}' -> HTTP ${CODE}"
+            # HERE IS THE HTTP 204 PATCH
             if [ "${CODE}" = "200" ] || [ "${CODE}" = "201" ] || [ "${CODE}" = "204" ]; then
               PATCHED=1
               break
             fi
             if [ "${CODE}" = "403" ]; then
-              echo "::error::403 en el PATCH: Token sin permisos de edición."
+              echo "::error::403 on PATCH: Token lacks edit permissions."
               exit 1
             fi
           done
 
           if [ "${PATCHED}" != "1" ]; then
-            echo "::error::No pude actualizar la policy '${POLICY_CD_ID}'."
+            echo "::error::Could not update policy '${POLICY_CD_ID}'."
             cat patch_resp.json 2>/dev/null || true
             exit 1
           fi
 
-      - name: Comprobar la policy publicada (round-trip, no es el control real)
+      - name: Verify published policy (round-trip, not the actual control)
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
           POLICY_CD_ID: CD_Docker_Check
@@ -246,7 +246,7 @@ jobs:
           printf '{"image": "%s"}\n' "${FULL_IMAGE}" > input_ok.json
           docker run --rm -v "${PWD}:/project" -w /project instrumenta/conftest:latest test input_ok.json -p downloaded_policy.rego
 
-      - name: Obtener el template de runtime inputs del pipeline completo
+      - name: Get runtime inputs template for the entire pipeline
         id: template
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -271,7 +271,7 @@ jobs:
           echo "prefix=${FOUND_PREFIX}" >> "$GITHUB_OUTPUT"
           echo "${TEMPLATE_YAML}" > template.yaml
 
-      - name: Rellenar y auditar el runtime input
+      - name: Fill and audit runtime input
         id: build_input
         run: |
           set -euo pipefail
@@ -380,7 +380,7 @@ jobs:
               yaml.dump({"pipeline": pipeline}, f, Dumper=NoAlias, sort_keys=False)
           PY
 
-      - name: Disparar el pipeline completo en Harness
+      - name: Trigger full pipeline in Harness
         id: trigger
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
@@ -393,18 +393,18 @@ jobs:
             -H "Content-Type: application/yaml" \
             "https://app.harness.io${PREFIX}/pipeline/api/pipeline/execute/${HARNESS_PIPELINE_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}&moduleType=CD" \
             --data-binary @runtime_input.yaml || {
-              echo "::error::curl falló disparando el pipeline. Respuesta:"
+              echo "::error::curl failed triggering the pipeline. Response:"
               cat exec_response.json 2>/dev/null || true
               exit 1
             }
 
           EXEC_ID="$(jq -r '.data.planExecution.uuid // empty' exec_response.json)"
           echo "exec_id=${EXEC_ID}" >> "$GITHUB_OUTPUT"
-          echo "Ejecución del pipeline disparada: ${EXEC_ID}"
+          echo "Pipeline execution triggered: ${EXEC_ID}"
 
-      # BLOQUE VERIFICAR (ELIMINADO AQUÍ)
+      # VERIFY BLOCK (REMOVED HERE)
 
-      - name: Esperar resultado de la ejecución
+      - name: Wait for execution result
         env:
           HARNESS_API_KEY: ${{ secrets.HARNESS_API_KEY }}
         run: |
@@ -418,18 +418,18 @@ jobs:
               "https://app.harness.io${PREFIX}/pipeline/api/pipelines/execution/v2/${EXEC_ID}?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${HARNESS_ORG_ID}&projectIdentifier=${HARNESS_PROJECT_ID}" \
               | jq -r '.data.pipelineExecutionSummary.status // "Unknown"')"
 
-            echo "[$i] Estado: ${STATUS}"
+            echo "[$i] Status: ${STATUS}"
 
             case "${STATUS}" in
               Success)
-                echo "Pipeline completado con éxito."
+                echo "Pipeline completed successfully."
                 exit 0 ;;
               Failed|Aborted|Errored|Expired|ApprovalRejected)
-                echo "::error::La ejecución terminó en ${STATUS}. Revisa el pipeline en Harness."
+                echo "::error::Execution finished with ${STATUS}. Check the pipeline in Harness."
                 exit 1 ;;
             esac
             sleep 15
           done
 
-          echo "::error::Timeout esperando la ejecución del pipeline."
+          echo "::error::Timeout waiting for pipeline execution."
           exit 1
