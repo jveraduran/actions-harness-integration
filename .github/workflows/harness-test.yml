@@ -361,18 +361,27 @@ jobs:
       APP_TAG: ${{ needs.build.outputs.app_tag }}
       APP_REPO: ${{ needs.build.outputs.app_repo }}
 
-      # Variables de pipeline (cd_deploy_policy_gate.variables). app_image_repo
-      # y app_image_tag se llenan solas desde el build. Las demás:
-      ENV_TYPE: PreProduction        # AJUSTA si el demo despliega a Production
-      CHANGE_NUMBER: ""              # obligatorio solo si ENV_TYPE=Production
-      RUN_ARTIFACT_SCAN: "false"     # vestigial — no tiene efecto sin el stage predeploy_gate
+      # Variables de pipeline: el pipeline actual YA NO declara ninguna
+      # (quitaste el bloque 'variables:' completo). Estas tres quedan sin
+      # uso — el resolver solo las aplica si encuentra una variable con ese
+      # nombre en el template. Se dejan por si vuelves a declararlas.
+      ENV_TYPE: PreProduction
+      CHANGE_NUMBER: ""
+      RUN_ARTIFACT_SCAN: "false"
 
-      # Identifier y type de la artifact source, tal como están en el
-      # Service "TEST". Son la llave con la que Harness empareja el override
-      # del pipeline contra la source del Service: si no coinciden, Harness
-      # descarta el bloque y el tag nunca llega (es exactamente el bug que
-      # causaba el "Failed to complete service step").
-      ARTIFACT_SOURCE_ID: Harness
+      # -----------------------------------------------------------------
+      #  Identifier y type de la artifact source, COPIADOS TAL CUAL del
+      #  Service "TEST". Son la llave con la que Harness empareja el
+      #  override que manda este Action contra la source del Service: si el
+      #  identifier no coincide exactamente, 'primaryArtifactRef' apunta a
+      #  una source que no existe, el artefacto no resuelve y el service
+      #  step falla.
+      #
+      #  OJO: en tu Service el identifier cambió de 'Harness' a
+      #  'HarnessArtifact'. Si vuelves a renombrarlo allá, hay que cambiarlo
+      #  aquí también — son el mismo valor en dos lugares.
+      # -----------------------------------------------------------------
+      ARTIFACT_SOURCE_ID: HarnessArtifact
       ARTIFACT_SOURCE_TYPE: Har
 
       # Service/Environment/Infra: en el pipeline actual están FIJOS
@@ -505,12 +514,15 @@ jobs:
               sys.exit(1)
 
           # ---------- 1) Variables de pipeline, por NOMBRE ----------
+          # Se aplica solo a las variables que EXISTAN en el template. Si el
+          # pipeline no declara 'variables:' (caso actual), este bloque no
+          # hace nada y no pasa nada.
           VAR_VALUES = {
               "app_image_repo":    APP_REPO,
               "app_image_tag":     APP_TAG,
-              "env_type":          os.environ["ENV_TYPE"],
-              "change_number":     os.environ["CHANGE_NUMBER"],
-              "run_artifact_scan": os.environ["RUN_ARTIFACT_SCAN"],
+              "env_type":          os.environ.get("ENV_TYPE", "PreProduction"),
+              "change_number":     os.environ.get("CHANGE_NUMBER", ""),
+              "run_artifact_scan": os.environ.get("RUN_ARTIFACT_SCAN", "false"),
           }
           # Variables donde un valor vacio SI es legitimo (.default("")).
           ALLOW_EMPTY_VARS = {"change_number"}
